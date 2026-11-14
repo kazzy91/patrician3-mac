@@ -4,7 +4,6 @@ out/
 *.a
 .venv/
 __pycache__/
-.ghidra/
 
 # Original game files must never be committed
 *.exe

@@ -9,6 +9,12 @@ Changes made to recomp.py (see scripts/fork_recomp.py):
   - the executable path comes from $P3_EXE (or p3_build.py --exe);
   - every NFS Most Wanted address-specific patch is gated behind Recompiler.nfs (False).
 
+recomp/difftest.py is adapted from the same project's recomp/difftest.py: its Cpu mirror, state generation and
+comparison are upstream's; the Unicorn setup replaces upstream's developer-only emulator module.
+
+runtime/boot.c and runtime/host.h follow the structure of the same project's runtime/boot.c and host.h (loader,
+TEB setup, dispatch, import thunks, host functions, call_guest); the Win32 subset is written for this project.
+
 runtime.h is unchanged and still declares a few NFS-specific hooks (e.g. car85_count) that this
 project does not use.
 
