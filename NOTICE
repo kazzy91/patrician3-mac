@@ -7,7 +7,10 @@ Changes made to recomp.py (see scripts/fork_recomp.py):
   - removed the speed.exe code-fingerprint check;
   - the image base is read from the PE header instead of being fixed at 0x400000;
   - the executable path comes from $P3_EXE (or p3_build.py --exe);
-  - every NFS Most Wanted address-specific patch is gated behind Recompiler.nfs (False).
+  - every NFS Most Wanted address-specific patch is gated behind Recompiler.nfs (False);
+  - added bswap, prefetch* (no-op) and movntq (as movq), which Patrician III's DLLs use;
+  - operand fields the program rewrites at run time (Recompiler.patched) are read from guest memory
+    (imm_c, disp_c, branch_field), for the self-modifying blitters in ddraw_dll.dll and AIM.dll.
 
 recomp/difftest.py is adapted from the same project's recomp/difftest.py: its Cpu mirror, state generation and
 comparison are upstream's; the Unicorn setup replaces upstream's developer-only emulator module.

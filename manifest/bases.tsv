@@ -1,0 +1,5 @@
+# Load addresses for DLLs whose own base is taken by another module (they share 0x10000000 with Archiver.dll).
+# p3_build.py --base rebases the image with its .reloc table before translation; the runtime applies the same fixups.
+aim	11000000
+vto	12000000
+schnelltransfer	13000000

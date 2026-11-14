@@ -149,12 +149,60 @@ class Recompiler:
         self.md.detail = True
         self.functions = functions or {}      # guest address -> limit (for direct-call targets)
         self.nfs = False                      # NFS speed.exe address patches: off for other games
+        self.patched = set()                  # code bytes the program rewrites at run time (self-modifying code)
         self.calls = False                    # True: translate calls/tail jumps (needs the callees' C too)
         self.seen = {}
         self.ft_exits = {}
         self.int3_stops = set()               # int3s with nothing after them (padding): translated as a return
         self.tables = {}
         self.callees = set()
+
+    # ---------- self-modifying code ----------
+    # Operand fields (immediate, displacement, branch offset) whose bytes are in self.patched are read from guest
+    # memory when the instruction runs, so the program's own patches take effect. Fields are found by matching the
+    # operand's encoding in the instruction bytes: immediates and branch offsets are the instruction's last bytes,
+    # displacements come before them.
+    def _tail_field(self, insn, value, sizes=(4, 2, 1)):
+        b = bytes(insn.bytes)
+        for k in sizes:
+            if k < len(b) and b[-k:] == (value & ((1 << 8 * k) - 1)).to_bytes(k, "little"):
+                return insn.address + len(b) - k, k
+        return None
+
+    def _patched(self, f):
+        return f is not None and any(a in self.patched for a in range(f[0], f[0] + f[1]))
+
+    def imm_c(self, insn, op, size):
+        """C for an immediate operand of `size` bytes."""
+        if self.patched:
+            f = self._tail_field(insn, op.imm)
+            if self._patched(f):
+                a, k = f
+                v = f"M{8 * k}(0x{a:08X}u)"
+                if k < size:
+                    v = f"({CTYPE[size]})({STYPE[size]})({STYPE[k]}){v}"
+                return f"({CTYPE[size]}){v}"
+        return f"({CTYPE[size]})0x{op.imm & ((1 << (8 * size)) - 1):X}u"
+
+    def disp_c(self, insn, disp):
+        if self.patched:
+            b = bytes(insn.bytes)
+            for k in (4, 1):
+                enc = (disp & ((1 << 8 * k) - 1)).to_bytes(k, "little")
+                for pos in range(1, len(b) - k + 1):
+                    if b[pos:pos + k] == enc:
+                        f = (insn.address + pos, k)
+                        if self._patched(f):
+                            return f"(uint32_t)(int32_t)(int{8 * k}_t)M{8 * k}(0x{f[0]:08X}u)"
+                        return f"0x{disp & 0xFFFFFFFF:X}u"
+        return f"0x{disp & 0xFFFFFFFF:X}u"
+
+    def branch_field(self, insn, target):
+        """(address, size) of a patched rel8/rel32 branch offset, or None."""
+        if not self.patched:
+            return None
+        f = self._tail_field(insn, (target - insn.address - insn.size) & 0xFFFFFFFF, (4, 1))
+        return f if self._patched(f) else None
 
     # ---------- operands ----------
     def ea(self, insn, op):
@@ -166,7 +214,7 @@ class Recompiler:
             idx = self.reg_read(insn.reg_name(m.index), 4)
             parts.append(f"{idx} * {m.scale}" if m.scale != 1 else idx)
         if m.disp or not parts:
-            parts.append(f"0x{m.disp & 0xFFFFFFFF:X}u")
+            parts.append(self.disp_c(insn, m.disp))
         e = " + ".join(parts)
         if m.segment == X.X86_REG_FS:
             e = f"c->fs_base + {e}"
@@ -204,7 +252,7 @@ class Recompiler:
         if op.type == CS_OP_REG:
             return self.reg_read(insn.reg_name(op.reg), size)
         if op.type == CS_OP_IMM:
-            return f"({CTYPE[size]})0x{op.imm & ((1 << (8 * size)) - 1):X}u"
+            return self.imm_c(insn, op, size)
         if op.type == CS_OP_MEM:
             # Only StartLicensedMusic's explicit-event search grows with Extra EA Trax.
             # The career/default loops must keep reading the real g_MaxSongs (26).
@@ -534,8 +582,10 @@ class Recompiler:
             # entry count, 154 MB bMalloc). Only padding int3s, with nothing after them to continue to, return.
             log = f"guest_breakpoint(c, 0x{i.address:08X}u);"
             return [f"{log} return; /* padding int3 */" if i.address in self.int3_stops else log]
-        if m in ("nop", "fnop", "wait", "fwait") or m.startswith("nop"):
-            return []
+        if m in ("nop", "fnop", "wait", "fwait") or m.startswith("nop") or m.startswith("prefetch"):
+            return []                          # prefetch* are cache hints (P3: ddraw_dll/AIM copy loops)
+        if m == "bswap":
+            return [self.wr(i, ops[0], f"__builtin_bswap32({self.rd(i, ops[0], 4)})")]
         if m == "mov":
             return [self.wr(i, ops[0], self.rd(i, ops[1], ops[0].size))]
         if m in ("movzx", "movsx"):
@@ -546,7 +596,7 @@ class Recompiler:
         if m == "lea":
             return [self.wr(i, ops[0], self.ea(i, ops[1]))]
         if m == "push":
-            v = self.rd(i, ops[0], 4) if ops[0].type != CS_OP_IMM else f"0x{ops[0].imm & 0xFFFFFFFF:X}u"
+            v = self.rd(i, ops[0], 4) if ops[0].type != CS_OP_IMM else self.imm_c(i, ops[0], 4)
             if ops[0].size == 2:
                 raise Unsupported("push16")
             return [f"{{ uint32_t v = {v}; c->esp -= 4; M32(c->esp) = v; }}"]
@@ -720,6 +770,21 @@ class Recompiler:
         if m == "sahf":
             return ["{ uint8_t ah = (uint8_t)(c->eax >> 8); sf = ah >> 7 & 1; zf = ah >> 6 & 1; pf = ah >> 2 & 1; af = ah >> 4 & 1; cf = ah & 1; }"]
         # ---- control flow ----
+        if (m == "jmp" or m == "call" or (m.startswith("j") and m[1:] in COND)) and ops and ops[0].type == CS_OP_IMM \
+                and self.calls and self.branch_field(i, ops[0].imm):
+            # The program rewrites this branch's target: compute it when the instruction runs.
+            a, k = self.branch_field(i, ops[0].imm)
+            nxt = i.address + i.size
+            t0 = ops[0].imm
+            tgt = f"uint32_t t = 0x{nxt:08X}u + (uint32_t)(int32_t)(int{8 * k}_t)M{8 * k}(0x{a:08X}u);"
+            if m == "call":
+                return [f"{{ {tgt} c->esp -= 4; M32(c->esp) = 0x{nxt:08X}u; dispatch(c, t); }} /* patched call */"]
+            same = f"goto L_{t0:08X};" if t0 in self.seen and (t0 == fstart or t0 not in self.functions) else \
+                   f"{{ {self.flags_to(t0)} ABI_SKIP(); f_{t0:08X}(c); return; }}" if t0 in self.functions else "{ }"
+            if t0 in self.functions and t0 not in self.seen:
+                self.callees.add(t0)
+            body = f"{{ {tgt} if (t == 0x{t0:08X}u) {same} else {{ ABI_SKIP(); dispatch(c, t); return; }} }} /* patched jump */"
+            return [body] if m == "jmp" else [f"if ({COND[m[1:]]}) {body}"]
         if m == "jmp":
             if ops[0].type == CS_OP_IMM:
                 t = ops[0].imm
@@ -777,7 +842,7 @@ class Recompiler:
         if m == "ret":
             n = ops[0].imm if ops else 0
             return [f"ABI_CHECK(0x{fstart:08X}u); c->esp += {4 + n}; return;"]
-        if m in MMX_OPS or m in ("movq", "movd", "emms", "pextrw", "pinsrw", "pmovmskb", "pshufw"):
+        if m in MMX_OPS or m in ("movq", "movntq", "movd", "emms", "pextrw", "pinsrw", "pmovmskb", "pshufw"):
             return self.mmx(i, m)
         if m.startswith("f"):
             return self.x87(i, m)
@@ -804,7 +869,7 @@ class Recompiler:
             raise Unsupported("sse2 " + m)
         if m == "emms":
             return []
-        if m == "movq":
+        if m in ("movq", "movntq"):           # movntq: non-temporal store, same result
             src = self.mmx_op(i, ops[1])
             if ops[0].type == CS_OP_MEM:
                 return [f"M64({self.ea(i, ops[0])}) = {src};"]
@@ -881,7 +946,7 @@ class Recompiler:
         T = CTYPE[s]
         n = BITS[s]
         a = self.rd(i, ops[0])
-        cnt = (f"{ops[1].imm & 31}" if len(ops) > 1 and ops[1].type == CS_OP_IMM else
+        cnt = (f"({self.imm_c(i, ops[1], 1)} & 31)" if len(ops) > 1 and ops[1].type == CS_OP_IMM else
                "(c->ecx & 31)" if len(ops) > 1 else "1")
         body = {
             "shl": f"r = ({T})(a << k); cf = (a >> ({n} - k)) & 1; of = ((r >> {n - 1}) & 1) ^ cf; {self.szp('r', s)}",
@@ -901,7 +966,7 @@ class Recompiler:
         if ops[0].size != 4:
             raise Unsupported("shld16")
         a, b = self.rd(i, ops[0]), self.rd(i, ops[1])
-        cnt = f"{ops[2].imm & 31}" if ops[2].type == CS_OP_IMM else "(c->ecx & 31)"
+        cnt = f"({self.imm_c(i, ops[2], 1)} & 31)" if ops[2].type == CS_OP_IMM else "(c->ecx & 31)"
         if m == "shld":
             body = "r = (a << k) | (b >> (32 - k)); cf = (a >> (32 - k)) & 1;"
         else:
@@ -921,10 +986,10 @@ class Recompiler:
         s = ops[0].size
         if s == 2:
             a = self.rd(i, ops[0]) if len(ops) == 2 else self.rd(i, ops[1])
-            b = self.rd(i, ops[1]) if len(ops) == 2 else f"(uint16_t){ops[2].imm & 0xFFFF}u"
+            b = self.rd(i, ops[1]) if len(ops) == 2 else self.imm_c(i, ops[2], 2)
             return [f"{{ int32_t r = (int32_t)(int16_t)({a}) * (int16_t)({b}); cf = of = r != (int16_t)r; {self.wr(i, ops[0], '(uint16_t)r')} }}"]
         a = self.rd(i, ops[0]) if len(ops) == 2 else self.rd(i, ops[1])
-        b = self.rd(i, ops[1]) if len(ops) == 2 else f"(uint32_t){ops[2].imm & 0xFFFFFFFF}u"
+        b = self.rd(i, ops[1]) if len(ops) == 2 else self.imm_c(i, ops[2], 4)
         return [f"{{ int64_t r = (int64_t)(int32_t)({a}) * (int32_t)({b}); cf = of = r != (int64_t)(int32_t)r; "
                 f"{self.wr(i, ops[0], '(uint32_t)r')} }}"]
 

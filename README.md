@@ -5,10 +5,9 @@ the static-recompilation approach of [nfs-most-wanted-mac](https://github.com/el
 the game's own 32-bit x86 code is translated to C ahead of time and compiled for arm64. Native host code then
 replaces Win32 / DirectDraw / Miles. There is no Wine, CrossOver or emulator involved.
 
-**Status: early boot.** `Patrician3.exe` and `Archiver.dll` translate fully and compile for arm64. The boot runtime
-runs the game's startup natively, from the C runtime and MFC through the archive layer and the hardware check, up to
-loading its renderer (`ddraw_dll.dll`), which doesn't exist yet. There is no window or graphics. See
-[docs/SPIKE.md](docs/SPIKE.md) for translation and test results and [docs/BOOT.md](docs/BOOT.md) for the runtime.
+**Status: a new game starts and runs in a Mac window.** `Patrician3.exe` and five of its DLLs are recompiled to
+arm64. The game boots natively, shows its menus, and a single-player game loads into the town view at 1280x1024.
+Playing has barely been tested, and there is no sound. See [docs/BOOT.md](docs/BOOT.md) and [docs/SPIKE.md](docs/SPIKE.md).
 
 You need your own copy of the game. This repository contains no game code, data or generated C. It holds only the
 tooling and a manifest of function addresses.
@@ -22,7 +21,8 @@ tooling and a manifest of function addresses.
 | `recomp/p3_build.py` | Translates every function of a module and compiles them → `out/build/<module>/<module>.a` + `report.txt` |
 | `recomp/difftest.py` | Differential tests: translated C vs the original x86 code under Unicorn, on random states |
 | `manifest/functions_ghidra.tsv`, `manifest/<module>_functions.tsv` | Function starts from Ghidra's analysis (addresses and names only) |
-| `runtime/` | Boot runtime: loader, dispatch, and the Win32 subset (KERNEL32, USER32/GDI32 headless, registry, files) |
+| `runtime/` | Runtime: loader, dispatch, Win32 (KERNEL32, USER32/GDI32, registry, files), DirectDraw, Miles (silent), the Mac window and input |
+| `manifest/bases.tsv` | Load addresses for DLLs that share a base with another module |
 | `ghidra/ExportFunctions.java` | Ghidra post-script that writes the manifest |
 | `scripts/` | `setup.sh` (Python venv), `build.sh`, `ghidra_export.sh`, `fork_recomp.py` (how the fork was made) |
 

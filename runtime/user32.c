@@ -11,7 +11,7 @@
 
 #include "host.h"
 
-uint32_t find_resource(uint32_t name, uint32_t type);
+uint32_t find_resource(uint32_t module, uint32_t name, uint32_t type);
 uint32_t resource_data(uint32_t entry);
 
 #define SCREEN_W 1024
@@ -97,6 +97,57 @@ static void post(uint32_t hwnd, uint32_t msg, uint32_t wp, uint32_t lp) {
     if (q_tail - q_head >= 1024) die("message queue full");
     queue[q_tail++ % 1024] = (Msg){hwnd, msg, wp, lp};
 }
+
+// ---------------- input (input.c) ----------------
+void input_pump(void);
+int input_scripted(void);
+int window_active(void);
+int user32_cursor_hidden(void) { return show_cursor < 0; }
+// The top-level window the game shows: the first visible one without an owner.
+static uint32_t main_window(void) {
+    for (int i = 0; i < NWIN; ++i) if (wins[i].used && wins[i].visible && !(wins[i].style & 0x40000000) && !wins[i].owner) return hwnd_of(&wins[i]);
+    for (int i = 0; i < NWIN; ++i) if (wins[i].used && !(wins[i].style & 0x40000000)) return hwnd_of(&wins[i]);
+    return 0;
+}
+// The deepest visible, enabled window containing the screen point, starting at `top`.
+static uint32_t window_at(uint32_t top, int x, int y) {
+    for (;;) {
+        uint32_t next = 0;
+        for (int i = NWIN - 1; i >= 0 && !next; --i) {
+            Win *k = &wins[i];
+            if (!k->used || !k->visible || !k->enabled || !(k->style & 0x40000000) || k->parent != top) continue;
+            int32_t ox, oy;
+            screen_origin(k, &ox, &oy);
+            if (x >= ox && x < ox + k->w && y >= oy && y < oy + k->h) next = hwnd_of(k);
+        }
+        if (!next) return top;
+        top = next;
+    }
+}
+void user32_post_mouse(uint32_t msg, uint32_t wp, int x, int y) {
+    uint32_t h = capture ? capture : window_at(main_window(), x, y);
+    Win *w = win_of(h);
+    if (!w) return;
+    int32_t ox, oy;
+    screen_origin(w, &ox, &oy);
+    uint32_t lp = (uint32_t)((y - oy) & 0xFFFF) << 16 | (uint32_t)((x - ox) & 0xFFFF);
+    if (msg == 0x20A) lp = (uint32_t)(y & 0xFFFF) << 16 | (uint32_t)(x & 0xFFFF);   // WM_MOUSEWHEEL: screen coordinates
+    if (msg == 0x200 && q_head != q_tail) {                // coalesce mouse moves, as Windows does
+        Msg *last = &queue[(q_tail - 1) % 1024];
+        if (last->msg == 0x200 && last->hwnd == h) { last->wp = wp; last->lp = lp; return; }
+    }
+    if (q_tail - q_head >= 1000) return;                   // the game isn't reading messages: drop input rather than stop
+    post(h, msg, wp, lp);
+}
+void user32_post_key(uint32_t msg, uint32_t wp, uint32_t lp) {
+    uint32_t h = win_of(focus) ? focus : win_of(active) ? active : main_window();
+    if (h && q_tail - q_head < 1000) post(h, msg, wp, lp);
+}
+void user32_request_close(void) {
+    uint32_t h = main_window();
+    if (h) post(h, 0x10, 0, 0);                            // WM_CLOSE
+    else { quit_posted = 1; quit_code = 0; }
+}
 // Fills msg with the next message (posted messages first, then due timers). Returns 0 if there is none.
 static int next_message(uint32_t out, int remove) {
     if (q_head != q_tail) {
@@ -133,6 +184,19 @@ static uint32_t send(Cpu *c, uint32_t hwnd, uint32_t msg, uint32_t wp, uint32_t 
     return wnd_call(c, w->proc, hwnd, msg, wp, lp);
 }
 
+static void destroy_window(Cpu *c, uint32_t h) {
+    if (!win_of(h)) return;
+    for (int i = 0; i < NWIN; ++i)
+        if (wins[i].used && (wins[i].parent == h || wins[i].owner == h)) destroy_window(c, hwnd_of(&wins[i]));
+    send(c, h, 0x02, 0, 0);                                // WM_DESTROY
+    send(c, h, 0x82, 0, 0);                                // WM_NCDESTROY
+    Win *w = win_of(h);
+    if (w) w->used = 0;
+    if (focus == h) focus = 0;
+    if (active == h) active = 0;
+    if (capture == h) capture = 0;
+}
+
 // ---------------- DefWindowProc (also the procedure of system classes) ----------------
 static int def_window_proc(Cpu *c) {
     uint32_t hwnd = arg(c, 0), msg = arg(c, 1), wp = arg(c, 2), lp = arg(c, 3);
@@ -143,7 +207,7 @@ static int def_window_proc(Cpu *c) {
     case 0x0C: if (w) snprintf(w->text, sizeof w->text, "%s", lp ? gptr(lp) : ""); RET(1, 4);   // WM_SETTEXT
     case 0x0D: if (!w || !wp) RET(0, 4); snprintf((char *)G + lp, wp, "%s", w->text); RET(strlen((char *)G + lp), 4);   // WM_GETTEXT
     case 0x0E: RET(w ? strlen(w->text) : 0, 4);            // WM_GETTEXTLENGTH
-    case 0x10: if (w) { uint32_t a[4] = {hwnd, 0x02, 0, 0}; (void)a; } RET(0, 4);   // WM_CLOSE: the app decides
+    case 0x10: destroy_window(c, hwnd); RET(0, 4);         // WM_CLOSE: destroys the window, as on Windows
     case 0x84: RET(1, 4);                                  // WM_NCHITTEST: HTCLIENT
     case 0x20: RET(0, 4);                                  // WM_SETCURSOR
     case 0x7F: RET(0, 4);                                  // WM_GETICON
@@ -333,11 +397,6 @@ int win32_user32(Cpu *c, const char *fn) {
         else if (arg(c, 2) && arg(c, 0) < 0x1000 && (arg(c, 0) & 1) == 0) M32(arg(c, 2)) = 0;
         RET(1, 4);
     }
-    F("GetKeyState") RET(0, 1);
-    F("GetKeyboardState") { memset(G + arg(c, 0), 0, 256); RET(1, 1); }
-    F("ToAscii") RET(0, 5);
-    F("GetCursorPos") { M32(arg(c, 0)) = SCREEN_W / 2; M32(arg(c, 0) + 4) = SCREEN_H / 2; RET(1, 1); }
-    F("SetCursorPos") RET(1, 2);
     F("SetCursor") RET(0, 1);
     F("ShowCursor") { show_cursor += arg(c, 0) ? 1 : -1; RET(show_cursor, 1); }
     F("MessageBoxA") {
@@ -354,7 +413,7 @@ int win32_user32(Cpu *c, const char *fn) {
     F("LoadStringA") {                                     // (inst, id, buf, cap)
         uint32_t id = arg(c, 1), buf = arg(c, 2);
         int cap = (int32_t)arg(c, 3);
-        uint32_t e = find_resource(id / 16 + 1, 6);       // RT_STRING
+        uint32_t e = find_resource(arg(c, 0), id / 16 + 1, 6);   // RT_STRING, in the module that asks
         if (!e || cap <= 0) { if (cap > 0) M8(buf) = 0; RET(0, 4); }
         uint32_t p = resource_data(e);
         for (unsigned k = 0; k < id % 16; ++k) p += 2 + 2 * M16(p);
@@ -438,22 +497,8 @@ int win32_user32(Cpu *c, const char *fn) {
         RET(r, 5);
     }
     F("DestroyWindow") {
-        Win *w = win_of(arg(c, 0));
-        if (!w) RET(0, 1);
-        uint32_t h = arg(c, 0);
-        for (int i = 0; i < NWIN; ++i)
-            if (wins[i].used && (wins[i].parent == h || wins[i].owner == h)) {
-                uint32_t a[1] = {hwnd_of(&wins[i])};
-                (void)a;
-                send(c, hwnd_of(&wins[i]), 0x02, 0, 0);
-                send(c, hwnd_of(&wins[i]), 0x82, 0, 0);
-                wins[i].used = 0;
-            }
-        send(c, h, 0x02, 0, 0);                            // WM_DESTROY
-        send(c, h, 0x82, 0, 0);                            // WM_NCDESTROY
-        if ((w = win_of(h))) w->used = 0;
-        if (focus == h) focus = 0;
-        if (active == h) active = 0;
+        if (!win_of(arg(c, 0))) RET(0, 1);
+        destroy_window(c, arg(c, 0));
         RET(1, 1);
     }
     F("IsWindow") RET(win_of(arg(c, 0)) != NULL, 1);
@@ -659,18 +704,21 @@ int win32_user32(Cpu *c, const char *fn) {
     }
     F("PostQuitMessage") { quit_posted = 1; quit_code = arg(c, 0); RET(0, 1); }
     F("PeekMessageA") {                                    // (msg, hwnd, min, max, flags)
+        input_pump();
         RET(next_message(arg(c, 0), arg(c, 4) & 1), 5);
     }
     F("GetMessageA") {
         for (;;) {
+            input_pump();
             if (next_message(arg(c, 0), 1)) RET(M32(arg(c, 0) + 4) != 0x12, 4);
             uint64_t due = next_timer_due();
+            if (window_active() || input_scripted()) { gil_release(); usleep(4000); gil_acquire(); continue; }   // wait for input
             if (due == UINT64_MAX) {
                 printf("boot: message loop idle: GetMessageA with no messages and no timers after %u import calls\n", import_calls);
                 exit(0);
             }
             uint64_t now = host_ticks();
-            if (due > now) usleep((useconds_t)((due - now) / 1000));
+            if (due > now) { gil_release(); usleep((useconds_t)((due - now) / 1000)); gil_acquire(); }
         }
     }
     F("TranslateMessage") RET(0, 1);
@@ -685,7 +733,6 @@ int win32_user32(Cpu *c, const char *fn) {
         RET(r, 1);
     }
     F("IsDialogMessageA") RET(0, 2);
-    F("GetMessagePos") RET((SCREEN_H / 2) << 16 | SCREEN_W / 2, 0);
     F("GetMessageTime") RET(msg_time, 0);
     F("ReuseDDElParam") RET(arg(c, 4) << 16 | (arg(c, 3) & 0xFFFF), 5);
     F("UnpackDDElParam") { if (arg(c, 2)) M32(arg(c, 2)) = arg(c, 1) & 0xFFFF; if (arg(c, 3)) M32(arg(c, 3)) = arg(c, 1) >> 16; RET(1, 4); }

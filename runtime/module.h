@@ -27,3 +27,4 @@ extern const unsigned module_count;
 const ModuleTables *module_by_name(const char *name);     // "Archiver.dll", "archiver", case-insensitive; NULL if absent
 const ModuleTables *module_by_base(uint32_t base);
 uint32_t module_export(const ModuleTables *m, const char *name_or_ordinal);   // 0 if absent
+int module_init(Cpu *c, const ModuleTables *m);            // runs DllMain once (dependencies first); 0 if it failed

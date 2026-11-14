@@ -4,6 +4,7 @@
 // case-insensitively: reads look in user_dir first (anything the game wrote), then in the game folder; writes always
 // go to user_dir, so the user's installation is never modified.
 #include <dirent.h>
+#include <sys/mman.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <fnmatch.h>
@@ -102,7 +103,34 @@ static int fd_of(uint32_t h) {
     if (h >= FILE_BASE && h < FILE_BASE + NFILES && files[h - FILE_BASE].used) return files[h - FILE_BASE].fd;
     return -1;
 }
+// ---------------- file mappings ----------------
+// Views are host mmaps of the file placed into guest memory at [MAP_BASE, MAP_END) (MAP_FIXED over the 4 GB
+// reservation), so a 240 MB archive costs no copy. Private (copy-on-write): the game only maps archives read-only.
+#define MAP_BASE 0x61000000u
+#define MAP_END  0x7E000000u
+#define MAPPING_BASE 0x1A00u
+static struct { int used, fd; uint64_t size; } mappings[32];
+static struct { uint32_t addr, size; } views[64];
+static uint32_t map_next = MAP_BASE;
+
+static uint32_t map_view(int fd, uint64_t off, uint32_t size) {
+    uint32_t page = (uint32_t)getpagesize();
+    uint64_t aligned = off & ~(uint64_t)(page - 1);
+    uint32_t lead = (uint32_t)(off - aligned), len = ((size + lead) + page - 1) & ~(page - 1);
+    uint32_t a = (map_next + 0xFFFF) & ~0xFFFFu;
+    if ((uint64_t)a + len > MAP_END) die("file mapping area full (%u MB mapped)", (map_next - MAP_BASE) >> 20);
+    void *p = mmap(G + a, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_FIXED, fd, (off_t)aligned);
+    if (p == MAP_FAILED) die("mmap of a file view failed: %s", strerror(errno));
+    map_next = a + len;
+    for (int i = 0; i < 64; ++i) if (!views[i].addr) { views[i].addr = a + lead; views[i].size = len; break; }
+    return a + lead;
+}
+
 int files_close(uint32_t h) {
+    if (h >= MAPPING_BASE && h < MAPPING_BASE + 32 && mappings[h - MAPPING_BASE].used) {
+        mappings[h - MAPPING_BASE].used = 0;
+        return 1;
+    }
     int fd = fd_of(h);
     if (fd < 0) return 0;
     close(fd);
@@ -221,6 +249,43 @@ int win32_files(Cpu *c, const char *fn) {
         RET(fd >= 0 && ftruncate(fd, lseek(fd, 0, SEEK_CUR)) == 0, 1);
     }
     F("FlushFileBuffers") RET(1, 1);
+    F("CreateFileMappingA") {                  // (file, sa, protect, size hi, size lo, name)
+        int fd = fd_of(arg(c, 0));
+        if (fd < 0) { last_error = 6; RET(0, 6); }
+        struct stat st;
+        fstat(fd, &st);
+        for (int i = 0; i < 32; ++i)
+            if (!mappings[i].used) {
+                mappings[i].used = 1;
+                mappings[i].fd = fd;
+                mappings[i].size = (uint64_t)arg(c, 3) << 32 | arg(c, 4);
+                if (!mappings[i].size) mappings[i].size = (uint64_t)st.st_size;
+                trace("      CreateFileMappingA(%08X, protect %X) size %llu\n", arg(c, 0), arg(c, 2), (unsigned long long)mappings[i].size);
+                RET(MAPPING_BASE + i, 6);
+            }
+        die("too many file mappings");
+    }
+    F("MapViewOfFile") {                       // (mapping, access, offset hi, offset lo, size)
+        uint32_t i = arg(c, 0) - MAPPING_BASE;
+        if (i >= 32 || !mappings[i].used) { last_error = 6; RET(0, 5); }
+        uint64_t off = (uint64_t)arg(c, 2) << 32 | arg(c, 3);
+        uint64_t size = arg(c, 4) ? arg(c, 4) : mappings[i].size - off;
+        uint32_t a = map_view(mappings[i].fd, off, (uint32_t)size);
+        trace("      MapViewOfFile(offset %llu, %llu bytes) -> %08X\n", (unsigned long long)off, (unsigned long long)size, a);
+        RET(a, 5);
+    }
+    F("UnmapViewOfFile") {
+        for (int i = 0; i < 64; ++i)
+            if (views[i].addr == arg(c, 0)) {
+                uint32_t page = (uint32_t)getpagesize(), start = views[i].addr & ~(page - 1);
+                // give the range back to the reservation (readable, zero) rather than unmapping it
+                mmap(G + start, views[i].size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0);
+                views[i].addr = 0;
+                RET(1, 1);
+            }
+        RET(0, 1);
+    }
+    F("FlushViewOfFile") RET(1, 2);
     F("LockFile") RET(1, 5);
     F("UnlockFile") RET(1, 5);
     F("GetFileType") RET(arg(c, 0) >= 0x100 && arg(c, 0) < 0x110 ? 2 : 1, 1);   // CHAR for std handles, DISK otherwise

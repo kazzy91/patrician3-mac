@@ -21,8 +21,11 @@ done
 } > $B/modules.c
 LIBS=""
 for m in $MODS; do LIBS="$LIBS $B/$m/$m.a"; done
-clang -arch arm64 -O1 -g -Wall -Wno-unused-function -Wno-misleading-indentation \
+clang -arch arm64 -O1 -g -Wall -Wno-unused-function -Wno-misleading-indentation -fobjc-arc \
     -I recomp -I runtime \
     runtime/boot.c runtime/heap.c runtime/files.c runtime/kernel32.c runtime/user32.c runtime/misc.c runtime/registry.c \
-    $B/modules.c $LIBS -o out/boot
+    runtime/display.c runtime/com.c runtime/ddraw.c runtime/d3d.c runtime/png.c runtime/extra.c runtime/mss32.c \
+    runtime/input.c runtime/threads.c runtime/window.m \
+    $B/modules.c $LIBS -lz -framework Cocoa -framework Metal -framework QuartzCore \
+    -Wl,-stack_size,0x4000000 -o out/boot
 echo "ok: out/boot (modules: $MODS)"

@@ -24,7 +24,7 @@
 uint8_t *G;
 int boot_trace;
 const char *game_dir, *user_dir;
-uint32_t last_error;
+__thread uint32_t last_error;
 unsigned import_calls;
 static Cpu *g_cpu;
 static const char *last_import = "(none)";
@@ -50,6 +50,22 @@ void trace(const char *fmt, ...) {
     va_end(ap);
 }
 
+// A host fault inside translated code: a guest access outside mapped memory can't happen (all 4 GB are reserved), so
+// this is a write to a read-only host page, a stack overflow, or a bug in the host layer. Reports the guest address
+// when the fault is inside guest memory, and the host call stack (translated functions are named f_<guest address>).
+#include <execinfo.h>
+static void on_fault(int sig, siginfo_t *info, void *ctx) {
+    (void)ctx;
+    uintptr_t a = (uintptr_t)info->si_addr, g = (uintptr_t)G;
+    fprintf(stderr, "boot: host fault (signal %d) at %p", sig, info->si_addr);
+    if (G && a >= g && a < g + (1ull << 32)) fprintf(stderr, " = guest address %08X", (uint32_t)(a - g));
+    fprintf(stderr, "; %u import calls, last %s\n", import_calls, last_import);
+    void *frames[48];
+    int n = backtrace(frames, 48);
+    backtrace_symbols_fd(frames, n, 2);
+    _exit(139);
+}
+
 static void on_timeout(int sig) {
     (void)sig;
     die("BOOT_TIMEOUT reached");
@@ -64,7 +80,7 @@ void host_cpuid(Cpu *c) {
     // A generic Pentium III class CPU: FPU, TSC, CX8, CMOV, MMX. No SSE (the translator handles MMX only).
     switch (c->eax) {
     case 0: c->eax = 1; c->ebx = 0x756E6547; c->edx = 0x49656E69; c->ecx = 0x6C65746E; break;   // "GenuineIntel"
-    case 1: c->eax = 0x00000673; c->ebx = 0; c->ecx = 0; c->edx = 0x0080FBFF; break;
+    case 1: c->eax = 0x00000673; c->ebx = 0; c->ecx = 0; c->edx = getenv("P3_NO_MMX") ? 0x0000FBFF : 0x0080FBFF; break;
     default: c->eax = c->ebx = c->ecx = c->edx = 0;
     }
 }
@@ -182,10 +198,14 @@ static void import_call(Cpu *c, unsigned index) {
     ++imports[index].calls;
     last_import = name;
     uint32_t ra = M32(c->esp), a0 = arg(c, 0), a1 = arg(c, 1), a2 = arg(c, 2), a3 = arg(c, 3);
-    int ok = !strcasecmp(dll, "KERNEL32.dll") ? win32_heap(c, fn) || win32_files(c, fn) || win32_kernel32(c, fn)
-           : !strcasecmp(dll, "USER32.dll") ? win32_user32(c, fn)
+    gil_maybe_yield();
+    int ok = !strcasecmp(dll, "KERNEL32.dll") ? win32_threads(c, fn) || win32_heap(c, fn) || win32_files(c, fn) || win32_kernel32(c, fn)
+           : !strcasecmp(dll, "USER32.dll") ? win32_display(c, fn) || win32_input(c, fn) || win32_user32(c, fn)
            : !strcasecmp(dll, "GDI32.dll") ? win32_gdi32(c, fn)
+           : !strcasecmp(dll, "DDRAW.dll") ? win32_ddraw(c, fn)
+           : !strcasecmp(dll, "mss32.dll") ? win32_mss32(c, fn)
            : win32_misc(c, dll, fn);
+    if (!ok) ok = win32_extra(c, dll, fn);
     if (!ok) die("not implemented yet: %s (call %u, return address %08X, args %08X %08X %08X %08X)",
                  name, import_calls, ra, a0, a1, a2, a3);
     trace("  [%u] %s(%X, %X, %X, %X) -> %X  @%08X\n", import_calls, name, a0, a1, a2, a3, c->eax, ra);
@@ -225,13 +245,13 @@ static void load_module(const ModuleTables *m) {
     uint8_t *pe = read_module(m->file, &size);
     uint32_t off = *(uint32_t *)(pe + 0x3C);
     uint16_t nsec = *(uint16_t *)(pe + off + 6), optsz = *(uint16_t *)(pe + off + 20);
-    uint32_t base = *(uint32_t *)(pe + off + 24 + 28), image_size = *(uint32_t *)(pe + off + 24 + 56);
-    if (base != m->base) die("%s: image base %08X differs from the translated %08X", m->file, base, m->base);
+    uint32_t file_base = *(uint32_t *)(pe + off + 24 + 28), image_size = *(uint32_t *)(pe + off + 24 + 56);
+    uint32_t base = m->base;                       // where it was translated (p3_build.py --base rebases)
     for (unsigned i = 0; i < module_count && all_modules[i] != m; ++i) {
         const ModuleTables *o = all_modules[i];
         uint32_t ob = o->base, oe = ob + M32(ob + M32(ob + 0x3C) + 24 + 56);
         if (base < oe && ob < base + image_size)
-            die("%s (%08X..%08X) overlaps %s: relocation is not implemented yet", m->file, base, base + image_size, o->file);
+            die("%s (%08X..%08X) overlaps %s: give it a free base in manifest/bases.tsv", m->file, base, base + image_size, o->file);
     }
     memcpy(G + base, pe, 0x1000);                                       // headers
     for (int i = 0; i < nsec; ++i) {
@@ -239,7 +259,46 @@ static void load_module(const ModuleTables *m) {
         uint32_t va = *(uint32_t *)(s + 12), rs = *(uint32_t *)(s + 16), raw = *(uint32_t *)(s + 20);
         memcpy(G + base + va, pe + raw, rs);
     }
+    if (base != file_base) {
+        // The same HIGHLOW fixups p3_build.py applied before translation (.reloc, data directory 5).
+        uint32_t rva = *(uint32_t *)(pe + off + 24 + 96 + 5 * 8), size = *(uint32_t *)(pe + off + 24 + 96 + 5 * 8 + 4);
+        uint32_t delta = base - file_base, p = base + rva, end = p + size, n = 0;
+        if (!rva) die("%s: rebased but has no relocation table", m->file);
+        while (p < end) {
+            uint32_t page = M32(p), block = M32(p + 4);
+            if (block < 8) break;
+            for (uint32_t k = 0; k < (block - 8) / 2; ++k) {
+                uint16_t e = M16(p + 8 + 2 * k);
+                if (e >> 12 == 3) { M32(base + page + (e & 0xFFF)) += delta; ++n; }
+                else if (e >> 12) die("%s: relocation type %u", m->file, e >> 12);
+            }
+            p += block;
+        }
+        M32(base + off + 24 + 28) = base;
+        printf("boot: %s rebased %08X -> %08X (%u fixups)\n", m->file, file_base, base, n);
+    }
     free(pe);
+}
+
+// DllMain(hinst, DLL_PROCESS_ATTACH, 0) once per module, after the modules it imports from.
+static unsigned char inited[64];
+int module_init(Cpu *c, const ModuleTables *m) {
+    unsigned idx = 0;
+    while (idx < module_count && all_modules[idx] != m) ++idx;
+    if (idx == 0 || inited[idx]) return 1;
+    inited[idx] = 1;
+    for (unsigned j = 0; j < m->import_count; ++j) {
+        char dll[64];
+        const char *bang = strchr(m->imports[j].name, '!');
+        snprintf(dll, sizeof dll, "%.*s", (int)(bang - m->imports[j].name), m->imports[j].name);
+        const ModuleTables *d = module_by_name(dll);
+        if (d && d != m && !module_init(c, d)) return 0;
+    }
+    uint32_t a[3] = {m->base, 1, 0};
+    uint32_t r = call_guest(c, m->entry, 3, a);
+    printf("boot: %s DllMain -> %u\n", m->file, r);
+    fflush(stdout);
+    return r != 0;
 }
 
 int main(int argc, char **argv) {
@@ -252,7 +311,16 @@ int main(int argc, char **argv) {
     user_dir = getenv("BOOT_USERDATA") ? getenv("BOOT_USERDATA") : ud;
     if (getenv("BOOT_TIMEOUT")) { signal(SIGALRM, on_timeout); alarm((unsigned)atoi(getenv("BOOT_TIMEOUT"))); }
     atexit(write_call_counts);
+    static char alt_stack[1 << 16];        // its own stack, so a host stack overflow is reported too
+    stack_t ss = {.ss_sp = alt_stack, .ss_size = sizeof alt_stack};
+    sigaltstack(&ss, NULL);
+    struct sigaction sa = {.sa_sigaction = on_fault, .sa_flags = SA_SIGINFO | SA_ONSTACK};
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGBUS, &sa, NULL);
 
+    display_init();
+    input_init();
+    window_init();
     G = mmap(0, 1ull << 32, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
     if (G == MAP_FAILED) die("cannot reserve 4 GB of guest memory");
     if (all_modules[0]->base != IMAGE_BASE) die("the first module must be the exe at %08X", IMAGE_BASE);
@@ -281,6 +349,7 @@ int main(int argc, char **argv) {
 
     Cpu cpu = {0}, *c = &cpu;
     g_cpu = c;
+    threads_init();
     c->fs_base = TEB;
     M32(TEB + 0x00) = 0xFFFFFFFF;          // SEH chain end
     M32(TEB + 0x04) = STACK_TOP;           // stack base
@@ -296,13 +365,13 @@ int main(int argc, char **argv) {
     for (unsigned i = 0; i < module_count; ++i) funcs += all_modules[i]->func_count;
     printf("boot: %u modules, %u translated functions, %u imports (%u bound between modules)\n", module_count, funcs, n_imports, bound);
     fflush(stdout);
-    for (unsigned i = 1; i < module_count; ++i) {         // DllMain(hinst, DLL_PROCESS_ATTACH, 0)
-        const ModuleTables *m = all_modules[i];
-        uint32_t a[3] = {m->base, 1, 0};
-        uint32_t r = call_guest(c, m->entry, 3, a);
-        printf("boot: %s DllMain -> %u\n", m->file, r);
-        fflush(stdout);
-        if (!r) die("%s: DllMain failed", m->file);
+    // The exe's static imports are initialised now; other modules when LoadLibrary first asks for them.
+    for (unsigned j = 0; j < all_modules[0]->import_count; ++j) {
+        char dll[64];
+        const char *name = all_modules[0]->imports[j].name, *bang = strchr(name, '!');
+        snprintf(dll, sizeof dll, "%.*s", (int)(bang - name), name);
+        const ModuleTables *d = module_by_name(dll);
+        if (d && !module_init(c, d)) die("%s: DllMain failed", d->file);
     }
     c->esp -= 4;
     M32(c->esp) = 0xDEADBEEF;              // entry's return address

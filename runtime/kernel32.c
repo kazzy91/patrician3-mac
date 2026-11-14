@@ -1,7 +1,6 @@
 // kernel32.c - the KERNEL32 subset Patrician3.exe uses (besides heap.c and files.c).
 //
-// Single-threaded for now: critical sections are no-ops, CreateThread records the thread without running it, and
-// waits return at once. Threads (the game uses a few) come with the GIL model of the NFS port's threads.c.
+// Threads, TLS, critical sections, events and waits are in threads.c.
 #include <ctype.h>
 #include <stdlib.h>
 #include <time.h>
@@ -15,10 +14,11 @@ int files_close(uint32_t h);
 // ---------------- PE resources ----------------
 // Walk the image's resource directory. Names/types are either integer IDs (MAKEINTRESOURCE: < 0x10000) or guest
 // strings ("#123" is also an ID). Returns the guest address of the IMAGE_RESOURCE_DATA_ENTRY, or 0.
-static uint32_t rsrc_base(void) {
-    uint32_t off = M32(IMAGE_BASE + 0x3C);
-    uint32_t rva = M32(IMAGE_BASE + off + 24 + 96 + 2 * 8);
-    return rva ? IMAGE_BASE + rva : 0;
+static uint32_t rsrc_base(uint32_t module) {
+    if (!module || !module_by_base(module)) module = IMAGE_BASE;
+    uint32_t off = M32(module + 0x3C);
+    uint32_t rva = M32(module + off + 24 + 96 + 2 * 8);
+    return rva ? module + rva : 0;
 }
 static int name_matches(uint32_t root, uint32_t entry_name, uint32_t want) {
     if (want < 0x10000) return !(entry_name & 0x80000000) && entry_name == want;
@@ -40,8 +40,8 @@ static uint32_t dir_find(uint32_t root, uint32_t dir, uint32_t want) {
     }
     return 0xFFFFFFFF;
 }
-uint32_t find_resource(uint32_t name, uint32_t type) {
-    uint32_t root = rsrc_base();
+uint32_t find_resource(uint32_t module, uint32_t name, uint32_t type) {
+    uint32_t root = rsrc_base(module);
     if (!root) return 0;
     uint32_t t = dir_find(root, root, type);
     if (t == 0xFFFFFFFF || !(t & 0x80000000)) return 0;
@@ -51,11 +51,19 @@ uint32_t find_resource(uint32_t name, uint32_t type) {
     if (lang == 0xFFFFFFFF || (lang & 0x80000000)) return 0;
     return root + lang;
 }
-uint32_t resource_data(uint32_t entry) { return entry ? IMAGE_BASE + M32(entry) : 0; }
+// The data entry's RVA is relative to the module whose resource directory holds it.
+uint32_t resource_data(uint32_t entry) {
+    if (!entry) return 0;
+    for (unsigned i = 0; i < module_count; ++i) {
+        uint32_t b = all_modules[i]->base, end = b + M32(b + M32(b + 0x3C) + 24 + 56);
+        if (entry >= b && entry < end) return b + M32(entry);
+    }
+    return IMAGE_BASE + M32(entry);
+}
 uint32_t resource_size(uint32_t entry) { return entry ? M32(entry + 4) : 0; }
 
 // ---------------- INI files ----------------
-static int ini_get(const char *file, const char *sec, const char *key, char *out, size_t n) {
+int ini_get(const char *file, const char *sec, const char *key, char *out, size_t n) {
     char host[2048];
     path_resolve(file, host, sizeof host, 0);
     FILE *f = fopen(host, "r");
@@ -82,7 +90,7 @@ static int ini_get(const char *file, const char *sec, const char *key, char *out
     fclose(f);
     return found;
 }
-static int ini_set(const char *file, const char *sec, const char *key, const char *val) {
+int ini_set(const char *file, const char *sec, const char *key, const char *val) {
     char src[2048], dst[2048];
     path_resolve(file, src, sizeof src, 0);
     path_resolve(file, dst, sizeof dst, 1);
@@ -130,17 +138,6 @@ static int ini_set(const char *file, const char *sec, const char *key, const cha
     return out != NULL;
 }
 
-// ---------------- small handle tables ----------------
-#define OBJ_BASE 0x2000u
-enum { OBJ_FREE, OBJ_EVENT, OBJ_THREAD };
-static struct { int kind; uint32_t state, start, param; } objs[512];
-static uint32_t obj_new(int kind) {
-    for (int i = 0; i < 512; ++i) if (objs[i].kind == OBJ_FREE) { objs[i].kind = kind; objs[i].state = 0; return OBJ_BASE + i; }
-    die("too many kernel objects");
-}
-
-static uint32_t tls[64];
-static uint64_t tls_used;
 static struct { uint32_t used; char name[256]; uint32_t refs; } atoms[256];
 
 static uint16_t cp1252_to_unicode(uint8_t b) { return b; }   // Latin-1 (good enough for the game's German/English text)
@@ -176,7 +173,11 @@ int win32_kernel32(Cpu *c, const char *fn) {
     F("LoadLibraryA") {
         const ModuleTables *m = module_by_name(gptr(arg(c, 0)));
         fprintf(stderr, "boot: LoadLibraryA(\"%s\") -> %s\n", gptr(arg(c, 0)), m ? "translated module" : "not available yet");
-        if (m) RET(m->base, 1);
+        if (m) {
+            uint32_t name = arg(c, 0);
+            if (!module_init(c, m)) { last_error = 1114; (void)name; RET(0, 1); }   // ERROR_DLL_INIT_FAILED
+            RET(m->base, 1);
+        }
         last_error = 126;
         RET(0, 1);
     }
@@ -212,8 +213,6 @@ int win32_kernel32(Cpu *c, const char *fn) {
     F("GetEnvironmentVariableA") { last_error = 203; RET(0, 3); }
     F("SetEnvironmentVariableA") RET(1, 2);
     F("GetCurrentProcess") RET(0xFFFFFFFF, 0);
-    F("GetCurrentThread") RET(0xFFFFFFFE, 0);
-    F("GetCurrentThreadId") RET(1, 0);
     F("ExitProcess") { fflush(stderr); printf("boot: ExitProcess(%u) after %u import calls\n", arg(c, 0), import_calls); exit((int)arg(c, 0)); }
     F("TerminateProcess") { printf("boot: TerminateProcess(%u)\n", arg(c, 1)); exit((int)arg(c, 1)); }
     F("CreateProcessA") { last_error = 2; RET(0, 10); }
@@ -355,49 +354,11 @@ int win32_kernel32(Cpu *c, const char *fn) {
         RET((int32_t)((p + (p >= 0 ? d / 2 : -d / 2)) / d), 3);
     }
 
-    // ---- TLS, synchronisation, threads (single-threaded for now) ----
-    F("TlsAlloc") {
-        for (int i = 0; i < 64; ++i) if (!(tls_used >> i & 1)) { tls_used |= 1ull << i; tls[i] = 0; RET(i, 0); }
-        RET(0xFFFFFFFF, 0);
-    }
-    F("TlsFree") { if (arg(c, 0) < 64) tls_used &= ~(1ull << arg(c, 0)); RET(1, 1); }
-    F("TlsGetValue") { last_error = 0; RET(arg(c, 0) < 64 ? tls[arg(c, 0)] : 0, 1); }
-    F("TlsSetValue") { if (arg(c, 0) < 64) tls[arg(c, 0)] = arg(c, 1); RET(1, 2); }
-    F("InitializeCriticalSection") { memset(G + arg(c, 0), 0, 24); RET(0, 1); }
-    F("DeleteCriticalSection") RET(0, 1);
-    F("EnterCriticalSection") RET(0, 1);
-    F("LeaveCriticalSection") RET(0, 1);
+    // ---- TLS, critical sections, events, threads, waits, Sleep: threads.c ----
     F("InterlockedIncrement") { M32(arg(c, 0)) += 1; RET(M32(arg(c, 0)), 1); }
     F("InterlockedDecrement") { M32(arg(c, 0)) -= 1; RET(M32(arg(c, 0)), 1); }
     F("InterlockedExchange") { uint32_t o = M32(arg(c, 0)); M32(arg(c, 0)) = arg(c, 1); RET(o, 2); }
-    F("CreateEventA") { uint32_t h = obj_new(OBJ_EVENT); objs[h - OBJ_BASE].state = arg(c, 2); RET(h, 4); }
-    F("SetEvent") { uint32_t i = arg(c, 0) - OBJ_BASE; if (i < 512) objs[i].state = 1; RET(1, 1); }
-    F("WaitForSingleObject") {
-        uint32_t i = arg(c, 0) - OBJ_BASE;
-        trace("      WaitForSingleObject(%08X, %u) -> returns at once (single-threaded)\n", arg(c, 0), arg(c, 1));
-        if (i < 512 && objs[i].kind == OBJ_EVENT && !objs[i].state && arg(c, 1) != 0xFFFFFFFF) RET(0x102, 2);   // WAIT_TIMEOUT
-        RET(0, 2);
-    }
-    F("CreateThread") {
-        uint32_t h = obj_new(OBJ_THREAD);
-        objs[h - OBJ_BASE].start = arg(c, 2);
-        objs[h - OBJ_BASE].param = arg(c, 3);
-        fprintf(stderr, "boot: CreateThread(start %08X, param %08X, flags %X) recorded, not run (threads not implemented)\n",
-                arg(c, 2), arg(c, 3), arg(c, 4));
-        if (arg(c, 5)) M32(arg(c, 5)) = 2 + (h - OBJ_BASE);
-        RET(h, 6);
-    }
-    F("ResumeThread") RET(1, 1);
-    F("SuspendThread") RET(0, 1);
-    F("SetThreadPriority") RET(1, 2);
-    F("ExitThread") die("ExitThread(%u) on the main thread", arg(c, 0));
-    F("CloseHandle") {
-        uint32_t h = arg(c, 0);
-        if (files_close(h)) RET(1, 1);
-        if (h - OBJ_BASE < 512) objs[h - OBJ_BASE].kind = OBJ_FREE;
-        RET(1, 1);
-    }
-    F("Sleep") { if (arg(c, 0)) usleep(arg(c, 0) * 1000u); RET(0, 1); }
+    F("CloseHandle") { files_close(arg(c, 0)); RET(1, 1); }
 
     // ---- time ----
     F("GetLocalTime") {
@@ -437,11 +398,12 @@ int win32_kernel32(Cpu *c, const char *fn) {
         RET((uint32_t)atoi(v), 4);
     }
     F("WritePrivateProfileStringA") {  // (sec, key, value, file)
+        if (!arg(c, 0) || !arg(c, 3)) RET(1, 4);           // no section: "flush the cache", nothing to do here
         RET(ini_set(gptr(arg(c, 3)), gptr(arg(c, 0)), arg(c, 1) ? gptr(arg(c, 1)) : NULL, arg(c, 2) ? gptr(arg(c, 2)) : NULL), 4);
     }
 
     // ---- resources ----
-    F("FindResourceA") RET(find_resource(arg(c, 1), arg(c, 2)), 3);
+    F("FindResourceA") RET(find_resource(arg(c, 0), arg(c, 1), arg(c, 2)), 3);
     F("LoadResource") RET(resource_data(arg(c, 1)), 2);
     F("LockResource") RET(arg(c, 0), 1);
 

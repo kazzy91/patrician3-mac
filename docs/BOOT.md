@@ -1,8 +1,8 @@
 # Boot runtime (2026-11-14)
 
-`runtime/` links the translated modules into one arm64 program, `out/boot`, and runs the game's own startup
-natively. It has no window and no drawing yet. Every Windows API call the game makes goes to the small Win32
-subset in `runtime/`; the first call that isn't implemented stops the run and names it.
+`runtime/` links the translated modules into one arm64 program, `out/boot`, and runs the game natively in a Mac
+window. Every Windows, DirectDraw and Miles call the game makes goes to the host layer in `runtime/`. The first
+call that isn't implemented stops the run and names it.
 
 ## Run it
 
@@ -18,79 +18,123 @@ runtime/build.sh
 out/boot "/path/to/Patrician III"
 ```
 
+The window scales the game's picture to fit and keeps its shape (black bars otherwise). It can be resized and made
+full screen (Ctrl-Cmd-F). Cmd-Q or the close button quits.
+
 Environment switches:
-- `BOOT_TRACE=1`: log every import call with its arguments and result.
+- `P3_HEADLESS=1`: no window (tests).
+- `P3_FRAMES=dir`: write every new picture the game presents to `dir/frame_NNNN.png`, at most twice a second.
+- `P3_INPUT="4:click 160 388;12:quit"`: scripted input in game pixels, for tests. See `runtime/input.c`.
+- `P3_WINDOW_DUMP=file.png`: once a second, write what Metal drew (read back from the drawable).
+- `P3_NO_ACTIVATE=1`: don't bring the window to the front.
+- `P3_RESOLUTION=WxH[xBPP]`: the game's mode. The default is the largest it supports, 1280x1024x32 (see Display).
+- `BOOT_TRACE=1`: log every import and COM call with arguments and results.
 - `BOOT_TIMEOUT=s`: stop after s seconds.
-- `BOOT_COUNTS=file`: write how often each import was called.
+- `BOOT_COUNTS=file`: how often each import was called.
 - `BOOT_USERDATA=dir`: use this folder instead of `~/Library/Application Support/patrician3-mac`.
 
-The game folder is only read. Everything the game writes (folders, INI changes, the registry, later saves) goes to
-the user folder, and reads look there first.
+The game folder is only read. Everything the game writes (settings, the registry, saves) goes to the user folder,
+and reads look there first.
 
 ## Where it stands
 
+**A new single-player game starts and runs.** A scripted Single Game -> Start loads Luebeck at 1280x1024x32 and the
+town view runs for a minute without stopping (people, date and gold display, minimap). Checked so far:
+- Menus by script and by hand (real mouse clicks reached the game in a user run).
+- The Metal picture, read back from the drawable, is correct at Retina size.
+- Not checked: playing (trading, sailing, dialogs), saving and loading, videos, keyboard typing.
+
+Known problems:
+- Three divide-by-zero sites are hit and skipped (`#DE` in the log): 0x42698C once, then 0x423FBB about 30 times a
+  second, 0x4AF82A once. A count that should be non-zero comes back 0 (`0x100 / f_004C5850(...)`); cause not found yet.
+- No sound (Miles is silent).
+
 ```
-boot: 2 modules, 13087 translated functions, 585 imports (15 bound between modules)
+boot: display 1280x1024x32
+boot: AIM.dll rebased 10000000 -> 11000000 (1863 fixups)
+boot: 5 modules, 17753 translated functions, 1110 imports (40 bound between modules)
 boot: archiver.dll DllMain -> 1
-boot: LoadLibraryA("ddraw_dll.dll") -> not available yet
-boot: MessageBox "Patrician 3": Patrician 3: Error loading SGL settings.
-boot: ExitProcess(0) after 6675 import calls
+boot: LoadLibraryA("ddraw_dll.dll") -> translated module
+boot: SetDisplayMode(800x600x16)
+boot: frame 0 -> out/frames/frame_0000.png          <- the main menu
 ```
 
-What runs, in order, all as translated code:
-1. **`Archiver.dll` is loaded and initialised.** It is recompiled like the exe (827 Ghidra functions → 1,006
-   translated). Its 15 exports are bound straight into `Patrician3.exe`'s import table, and its `DllMain` runs first.
-2. **C runtime startup:** heap, TLS, locale and code pages, environment, command line.
-3. **The C++ static constructors:** 551 entries in the `_initterm` tables, including one that opens a `.cpr`
-   archive through Archiver.
-4. **MFC application startup.**
-5. **The hardware check.** The game reads `HKLM\SOFTWARE\Ascaron\Patrizier 2`. `runtime/registry.c` seeds
-   `Adapter` and marks the usual video modes `"OK"` (the game's table is UNTESTED / OK / INAVAILABLE). Without this,
-   the game asks for `P2Setup.exe` and quits.
-6. **The `[SGL]` settings from `game.ini`:** resolution 800×600, among others.
-7. **`LoadLibraryA("ddraw_dll.dll")`**, the renderer. It isn't available, so the game reports
-   "Error loading SGL settings", posts `WM_QUIT`, runs every destructor and exits with code 0.
+Five modules are recompiled and linked together:
 
-The orderly shutdown matters as evidence: thousands of translated functions (constructors, MFC, the archive layer,
-then the destructors) ran without a translation fault.
+| Module | Role | Functions | Notes |
+|---|---|---|---|
+| `Patrician3.exe` | the game | 12,919 | |
+| `ddraw_dll.dll` | SGL renderer (DirectDraw) | 2,723 | Loaded with `LoadLibrary`. Its hand-written `ASSEG` assembly rewrites its own jumps. 1,174 SSE instructions are left untranslated; the CPU we report has no SSE, so they're never reached. |
+| `AIM.dll` | image loading and colour conversion | 569 | Rebased to 0x11000000. Its blitters patch their own masks and shifts. |
+| `Archiver.dll` | `.cpr` archives | 1,117 | Uses memory-mapped files. |
+| `Vto.dll` | `.sks` video player | 873 | Rebased to 0x12000000. Untested: no video has played yet. |
+| `ijl11.dll` | Intel JPEG library | 425 | Imported by ordinal. Needs its own version resource to load. |
+
+## Display
+
+The game supports 800x600, 1024x768 and 1280x1024, each at 16 or 32 bits (its own mode table).
+- **Default mode:** `display.c` picks the largest, 1280x1024x32. It writes that choice into the user folder's
+  `P2.cfg` (`AUFLOESUNG=2`, `FARBTIEFE=1`) and `game.ini` (`[SGL] Size`, `ColDepth`) unless they were already set.
+- **Hardware test:** `registry.c` marks every mode "OK", so the video test `P3Setup.exe` runs on Windows is skipped.
+- **Main menu:** the game opens its menus at 800x600x16 regardless, as on Windows. The Options screen confirms the
+  configured mode (1280 x 1024, 32 bit); it should apply when a game starts, which hasn't been reached yet.
+
+1280x1024 is 5:4, so the window scales it to the screen with bars at the sides rather than stretching it.
+Resolutions above the game's own table would need changes to its mode table and UI layout.
 
 ## How it works
 
 - **`boot.c`**
-  - **Loader:** maps every module at its own base address in a 4 GB guest space.
-  - **Import binding:** a slot naming another loaded module's export points at that export; every other slot
-    points at a thunk.
-  - **Startup:** builds the TEB (`fs:`), the PEB and a 4 MB stack, runs each DLL's `DllMain`, then the exe's entry point.
-  - **`dispatch()`:** routes indirect calls to translated functions (binary search over every module, with a cache),
-    to host functions, or to imports.
-- **Win32 subset**
-  - `kernel32.c`: version, modules (`GetModuleHandle`, `LoadLibrary` and `GetProcAddress` know about translated modules),
-    strings and code pages, TLS, synchronisation (single-threaded for now), time, INI files, atoms, PE resources.
-  - `heap.c`: Heap*, Global*, Local* and VirtualAlloc, using size classes with free lists.
-  - `files.c`: Windows paths resolved case-insensitively against the user folder, then the game folder.
-  - `registry.c`: `user_dir/registry.txt`.
-  - `user32.c`: a headless window manager. Classes and windows, the CBT hook MFC uses to attach `CWnd` objects,
-    `SendMessage`/`PostMessage`, `GetMessage`/`PeekMessage`, timers and properties, `LoadString` from the exe's
-    resources, `wsprintf`, and GDI calls that succeed without drawing anything.
-- **Build**
-  - `recomp/p3_build.py --module NAME` builds any module into `out/build/NAME/`, and also emits its exports.
-  - `scripts/build.sh` builds the exe plus every DLL that has a manifest (`manifest/<module>_functions.tsv`).
-  - `runtime/build.sh` links every module it finds.
+  - **Loader:** maps every module at its build-time base (applying `.reloc` fixups when it was rebased) in a 4 GB guest space.
+  - **Imports:** binds imports between modules; every other import goes to a thunk.
+  - **Startup:** builds the TEB, PEB and stack. `DllMain` runs when a module is first needed (dependencies first),
+    either at boot for the exe's static imports or through `LoadLibrary`.
+  - **`dispatch()`:** routes indirect calls to translated functions, host functions or imports.
+- **Win32**
+  - `kernel32.c`: modules, strings, TLS, sync, time, INI files, atoms, and resources per module.
+  - `heap.c`: the heap functions.
+  - `files.c`: files and memory-mapped files. Views are host `mmap`s placed into guest memory.
+  - `registry.c`: the registry, stored in a text file.
+  - `user32.c`: a headless window manager.
+  - `display.c`: display modes.
+  - `extra.c`: everything else the modules import (locale, VERSION resources, GDI and dialog stubs).
+- **DirectDraw**
+  - `com.c` builds COM objects whose methods are host functions; a missing method stops the run with `Interface::Method`.
+  - `ddraw.c` covers IDirectDraw 1/2/4, surfaces 1–4, palettes and clippers. Surfaces are guest memory.
+    `Blt`/`BltFast` do copy, stretch, colour key and fills in software; `Flip` swaps the chain and presents.
+  - `d3d.c` reports Direct3D requests; the menu doesn't use 3D.
+- **Threads:** `threads.c`. Each guest thread is a pthread with its own CPU state, stack and TEB; one global lock lets
+  one run at a time, handed over at sleeps and waits. TLS, critical sections and events live there too.
+- **Miles audio:** `mss32.c` provides working handles and file loading, plays nothing, and reports every sound as finished.
+- **Window and input**
+  - `window.m`: a Cocoa window with a Metal layer. The game runs on the main thread and never returns to a Cocoa run
+    loop, so events are taken by hand whenever the game calls `PeekMessage`, `GetMessage` or `Sleep`. Each presented
+    frame is uploaded as a texture and drawn as one scaled quad.
+  - `input.c`: mouse and key state (`GetCursorPos`, `GetAsyncKeyState`, ...) and the window messages for them
+    (`WM_MOUSEMOVE`, button, wheel, `WM_KEYDOWN`/`WM_KEYUP`/`WM_CHAR`), from the window or from the `P3_INPUT` script.
+    Mouse messages go to the window under the pointer, in its client coordinates; mouse moves are coalesced.
+  - The game hides the system cursor and draws its own (a quill), so the Mac cursor is hidden over the game area.
+  - Closing the window sends `WM_CLOSE`. The menu ignores it, so the port exits by itself after 2 seconds.
+
+### Self-modifying code
+
+`ddraw_dll` and `AIM` keep hand-written assembly in a writable section (`ASSEG`) and patch it at run time:
+- AIM's colour converters write the display's shifts, masks and memory offsets into their own instructions
+  (placeholders such as `[esi + 0xAAAAAAAA]`).
+- The SGL rasteriser rewrites ~60 `jmp` targets to pick its MMX or plain routines.
+
+Static translation would keep the placeholders; the first menu frame came out in garbage colours because of it.
+`p3_build.py self_modifying()` finds every store with an absolute target inside code. The translator then reads
+those operand fields (immediates, displacements, branch offsets) from guest memory when the instruction runs, and
+the values stored into jump fields become function starts. That keeps native speed and needs no interpreter. It
+only catches stores to absolute addresses; a store through a register into code would still be missed.
 
 ## Next
 
-1. **The renderer, `ddraw_dll.dll`: 198 `sgl_*` exports.** Two routes:
-   - Recompile it like Archiver. It is then a DirectDraw/Direct3D 7 client, so the runtime needs DirectDraw and D3D7
-     on Metal.
-   - Implement the `sgl_*` API directly on Metal as host functions that `GetProcAddress` returns. This means less
-     emulation, but the 198 functions need to be understood first; their names and the game's call sites are the guide.
-
-   Either way, the first visible milestone is a window that shows the game's loading screen.
-2. **Real windows and input:** a Cocoa window behind the main game window, and mouse and keyboard turned into the
-   game's messages.
-3. **The other game DLLs:**
-   - `mss32.dll` (Miles audio): reimplement the 43 `AIL_*` calls on CoreAudio.
-   - `VTO.dll` (video), `AIM.dll` (images) and `SchnellTransfer.dll` (LAN): recompile or reimplement. Recompiling needs
-     relocation, since all three share base 0x10000000 with Archiver.
-4. **Threads.** `CreateThread` is only recorded so far; the game starts a few.
-5. **Structured exception handling and C++ `throw`.** `RaiseException` and `RtlUnwind` stop the run if they are reached.
+1. **Play by hand** and note where it stops; the log names the missing piece.
+2. **The divide-by-zero sites** above.
+3. **Audio:** Miles streams and samples on CoreAudio.
+4. **Structured exceptions and C++ `throw`:** `RaiseException`/`RtlUnwind` stop the run if reached.
+5. **Direct3D:** requested by the renderer (`IDirect3DTexture2` from a surface) and refused; the game falls back to 2D. Not needed so far.
+6. **`SchnellTransfer.dll` (LAN):** not loaded.
+7. **An app bundle,** so the game has its own name and icon (it shows as "boot" now).

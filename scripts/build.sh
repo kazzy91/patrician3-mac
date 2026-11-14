@@ -14,5 +14,6 @@ find_file() { find "$GAME" -maxdepth 1 -iname "$1" | head -1; }
 for f in manifest/*_functions.tsv; do
     [ -e "$f" ] || continue
     m=$(basename "$f" _functions.tsv)
-    .venv/bin/python recomp/p3_build.py --exe "$(find_file "$m.dll")" --module "$m"
+    base=$(awk -v m="$m" '$1 == m { print $2 }' manifest/bases.tsv)
+    .venv/bin/python recomp/p3_build.py --exe "$(find_file "$m.dll")" --module "$m" ${base:+--base $base}
 done

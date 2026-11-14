@@ -60,15 +60,15 @@ def fp80(mant, exp):
         return sign * float("inf")
 
 
-def all_functions(pe):
+def all_functions(pe, manifest, delta=0):
     sec = p3_build.sections(pe)
-    text_lo, text_hi = sec[".text"]
-    named = p3_build.load_functions(os.path.join(HERE, "..", "manifest", "functions_ghidra.tsv"), text_lo, text_hi)
-    extra, _, _ = p3_build.add_data_referenced(pe, named, text_lo, text_hi, sec)
+    code = p3_build.Code(pe)
+    named = p3_build.load_functions(manifest, code, delta)
+    extra, _, _ = p3_build.add_data_referenced(pe, named, code, sec)
     starts = dict(named)
     starts.update((t, f"data_ref_{t:08X}") for t in extra)
-    p3_build.add_call_targets(pe, starts, text_lo, text_hi)
-    return p3_build.make_funcs(starts, text_hi)
+    p3_build.add_call_targets(pe, starts, code)
+    return p3_build.make_funcs(starts, code)
 
 
 def build(rc, funcs, workdir):
@@ -115,6 +115,8 @@ def main():
     ap.add_argument("--calls", action="store_true", help="test non-leaf functions (callees compiled in)")
     ap.add_argument("--max-closure", type=int, default=40)
     ap.add_argument("--log", help="also write the report to this file")
+    ap.add_argument("--module", default="p3", help="module name (manifest/<module>_functions.tsv); p3 = Patrician3.exe")
+    ap.add_argument("--base", help="rebase address (hex), as in manifest/bases.tsv")
     args = ap.parse_args()
     if not args.exe:
         ap.error("pass --exe path/to/Patrician3.exe (or set P3_EXE)")
@@ -125,8 +127,14 @@ def main():
     UREG = dict(zip(REGS, [UC_X86_REG_EAX, UC_X86_REG_ECX, UC_X86_REG_EDX, UC_X86_REG_EBX, UC_X86_REG_ESP,
                            UC_X86_REG_EBP, UC_X86_REG_ESI, UC_X86_REG_EDI]))
     rnd = random.Random(args.seed)
-    pe = recomp.PE(args.exe)
-    funcs = all_functions(pe)
+    exe, delta = args.exe, 0
+    if args.base:
+        exe = os.path.join(tempfile.mkdtemp(prefix="p3rebase_"), os.path.basename(args.exe) + ".rebased")
+        p3_build.rebase(args.exe, int(args.base, 16), exe)
+        delta = (int(args.base, 16) - recomp.PE(args.exe).base) & 0xFFFFFFFF
+    pe = recomp.PE(exe)
+    manifest = os.path.join(HERE, "..", "manifest", "functions_ghidra.tsv" if args.module == "p3" else f"{args.module}_functions.tsv")
+    funcs = all_functions(pe, manifest, delta)
     rc = recomp.Recompiler(pe=pe, functions={a: l for a, l, _ in funcs})
     rc.calls = args.calls
     ok, callees, reasons, uses_fs = [], {}, {}, 0
@@ -187,6 +195,8 @@ def main():
     data_sec = [(pe.base + va, max(vs, rs)) for nm, vs, va, rs, raw in pe.sections if nm.startswith(b".data")][0]
     data_init = [(pe.base + va, (pe.data[raw:raw + rs] + bytes(max(vs, rs)))[:max(vs, rs)])
                  for nm, vs, va, rs, raw in pe.sections if nm.startswith(b".data")][0]
+    sections_init = [(pe.base + va, (pe.data[raw:raw + rs] + bytes(max(vs, rs)))[:max(vs, rs)])
+                     for nm, vs, va, rs, raw in pe.sections]
     img_lo = pe.base
     img_hi = max(pe.base + va + max(vs, rs) for _, vs, va, rs, _ in pe.sections)
 
@@ -228,7 +238,8 @@ def main():
             args_ = [SCRATCH + rnd.randrange(0x1000, 0xF000, 4) if rnd.random() < 0.6 else rnd.getrandbits(8) for _ in range(8)]
             stack_img = struct.pack("<I", RETURN_TRAP) + struct.pack("<8I", *args_)
             other_intr.clear()
-            uc.mem_write(*data_init)
+            for va, b in sections_init:        # every section at full size, so ASSEG data and .bss start fresh too
+                uc.mem_write(va, b)
             uc.mem_write(SCRATCH, scratch)
             uc.mem_write(esp - 0x400, stack)
             uc.mem_write(esp, stack_img)

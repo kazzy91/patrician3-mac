@@ -32,7 +32,7 @@ void trace(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 extern int boot_trace;
 extern const char *game_dir;     // the user's Patrician III folder (read-only: never written)
 extern const char *user_dir;     // ~/Library/Application Support/patrician3-mac: saves, settings, written files
-extern uint32_t last_error;
+extern __thread uint32_t last_error;
 extern unsigned import_calls;
 
 void dispatch(Cpu *c, uint32_t target);
@@ -63,3 +63,17 @@ int win32_user32(Cpu *c, const char *fn);
 int win32_gdi32(Cpu *c, const char *fn);
 int win32_misc(Cpu *c, const char *dll, const char *fn);   // SHELL32, WINMM, ... (misc.c)
 int win32_advapi(Cpu *c, const char *fn);                   // registry.c
+int win32_display(Cpu *c, const char *fn);                  // display.c: EnumDisplaySettings, ChangeDisplaySettings
+int win32_ddraw(Cpu *c, const char *fn);                    // ddraw.c
+int win32_mss32(Cpu *c, const char *fn);                    // mss32.c: Miles, silent
+int win32_extra(Cpu *c, const char *dll, const char *fn);   // extra.c: the rest of the imported surface
+int win32_threads(Cpu *c, const char *fn);                  // threads.c: threads, TLS, critical sections, events, waits
+void threads_init(void);                                    // the calling (main) thread takes the GIL
+void gil_acquire(void);
+void gil_release(void);
+void gil_maybe_yield(void);
+int win32_input(Cpu *c, const char *fn);                    // input.c: cursor and key state
+void input_init(void);                                      // input.c: P3_INPUT script
+void window_init(void);                                     // window.m: the Mac window (not with P3_HEADLESS)
+void display_init(void);                                    // display.c: the game resolution (P3_RESOLUTION)
+extern int display_w, display_h, display_bpp;
