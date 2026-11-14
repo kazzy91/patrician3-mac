@@ -1,0 +1,15 @@
+recomp/recomp.py and recomp/runtime.h are derived from nfs-most-wanted-mac
+(https://github.com/elforeign/nfs-most-wanted-mac), commit 52247d2b0d9b9039d45500866388c1365203ddea
+(2026-11-09). That code is licensed under the MIT License; its license text is kept in
+LICENSE.nfs-most-wanted-mac.
+
+Changes made to recomp.py (see scripts/fork_recomp.py):
+  - removed the speed.exe code-fingerprint check;
+  - the image base is read from the PE header instead of being fixed at 0x400000;
+  - the executable path comes from $P3_EXE (or p3_build.py --exe);
+  - every NFS Most Wanted address-specific patch is gated behind Recompiler.nfs (False).
+
+runtime.h is unchanged and still declares a few NFS-specific hooks (e.g. car85_count) that this
+project does not use.
+
+Patrician III is (c) Ascaron Entertainment. No game code, data or C generated from it is included here.

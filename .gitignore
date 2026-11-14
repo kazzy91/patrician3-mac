@@ -1,0 +1,18 @@
+# Build output (generated C is derived from the game's code: never commit it)
+out/
+*.o
+*.a
+.venv/
+__pycache__/
+.ghidra/
+
+# Original game files must never be committed
+*.exe
+*.dll
+*.DLL
+*.cpr
+*.cp0
+*.bik
+*.asi
+*.flt
+.DS_Store
