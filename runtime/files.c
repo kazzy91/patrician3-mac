@@ -197,7 +197,11 @@ int win32_files(Cpu *c, const char *fn) {
         }
         int fd = open(host, fl, 0644);
         trace("      CreateFileA(\"%s\") -> %s%s\n", win, host, fd < 0 ? " (failed)" : "");
-        if (fd < 0) { last_error = errno == ENOENT ? 2 : errno == EEXIST ? 80 : 5; RET(0xFFFFFFFF, 7); }
+        if (fd < 0) {
+            if (getenv("P3_LOG_MISSES")) fprintf(stderr, "miss: CreateFileA(\"%s\")\n", win);
+            last_error = errno == ENOENT ? 2 : errno == EEXIST ? 80 : 5;
+            RET(0xFFFFFFFF, 7);
+        }
         last_error = 0;
         RET(file_handle(fd), 7);
     }
@@ -330,10 +334,18 @@ int win32_files(Cpu *c, const char *fn) {
         if (!lookup(user_dir, rel, finds[i].dir, sizeof finds[i].dir)) lookup(game_dir, rel, finds[i].dir, sizeof finds[i].dir);
         finds[i].d = opendir(finds[i].dir);
         trace("      FindFirstFileA(\"%s\") in %s\n", win, finds[i].dir);
-        if (!finds[i].d) { last_error = 3; RET(0xFFFFFFFF, 2); }
+        if (!finds[i].d) {
+            if (getenv("P3_LOG_MISSES")) fprintf(stderr, "miss: FindFirstFileA(\"%s\") (no folder)\n", win);
+            last_error = 3;
+            RET(0xFFFFFFFF, 2);
+        }
         snprintf(finds[i].pattern, sizeof finds[i].pattern, "%s", pat);
         finds[i].used = 1;
-        if (!find_next(i, arg(c, 1))) { closedir(finds[i].d); finds[i].used = 0; last_error = 2; RET(0xFFFFFFFF, 2); }
+        if (!find_next(i, arg(c, 1))) {
+            if (getenv("P3_LOG_MISSES")) fprintf(stderr, "miss: FindFirstFileA(\"%s\") (no match)\n", win);
+            closedir(finds[i].d); finds[i].used = 0; last_error = 2;
+            RET(0xFFFFFFFF, 2);
+        }
         RET(FIND_BASE + i, 2);
     }
     F("FindNextFileA") {

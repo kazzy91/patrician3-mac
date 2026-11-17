@@ -131,12 +131,24 @@ void ddraw_display_size(int *w, int *h) {
     *w = mode_w ? (int)mode_w : display_w;
     *h = mode_h ? (int)mode_h : display_h;
 }
+// Frames for the window: the game draws on several threads, but Cocoa and Metal belong to the main thread. Any thread
+// leaves its latest picture here; the main thread shows it (ddraw_flush_present, from window_pump and from here).
+static pthread_mutex_t pending_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint32_t *pending, pending_cap;
+static int pending_w, pending_h, pending_dirty;
+void ddraw_flush_present(void) {
+    pthread_mutex_lock(&pending_lock);
+    if (pending_dirty) { window_present(pending, pending_w, pending_h); pending_dirty = 0; }
+    pthread_mutex_unlock(&pending_lock);
+}
 static void present(Surf *s) {
-    if (window_active() && pthread_main_np()) {
-        static uint32_t *buf;
-        static uint32_t cap;
-        if (cap < s->w * s->h) { free(buf); cap = s->w * s->h; buf = malloc(4 * cap); }
-        window_present(present_rgb(s, buf), (int)s->w, (int)s->h);
+    if (window_active()) {
+        pthread_mutex_lock(&pending_lock);
+        if (pending_cap < s->w * s->h) { free(pending); pending_cap = s->w * s->h; pending = malloc(4 * pending_cap); }
+        present_rgb(s, pending);
+        pending_w = (int)s->w; pending_h = (int)s->h; pending_dirty = 1;
+        pthread_mutex_unlock(&pending_lock);
+        if (pthread_main_np()) ddraw_flush_present();
     }
     const char *dir = getenv("P3_FRAMES");
     if (!dir) return;
@@ -427,8 +439,23 @@ static void rect_of(uint32_t r, Surf *s, int32_t *x0, int32_t *y0, int32_t *x1, 
     if (r) { *x0 = M32(r); *y0 = M32(r + 4); *x1 = M32(r + 8); *y1 = M32(r + 12); }
     else { *x0 = 0; *y0 = 0; *x1 = s->w; *y1 = s->h; }
 }
+static void blit_rows(Surf *d, int32_t dx0, int32_t dy0, int32_t dx1, int32_t dy1, Surf *s, int32_t sx0, int32_t sy0, int32_t sx1, int32_t sy1,
+                      int keyed, uint32_t key_lo, uint32_t key_hi);
+// A copy within one surface (the game scrolls its view by shifting the back buffer onto itself) reads from a snapshot
+// of the source rows, so overlapping rectangles copy correctly in any direction.
 static void blit(Surf *d, int32_t dx0, int32_t dy0, int32_t dx1, int32_t dy1, Surf *s, int32_t sx0, int32_t sy0, int32_t sx1, int32_t sy1,
                  int keyed, uint32_t key_lo, uint32_t key_hi) {
+    if (d != s || d->mem != s->mem) { blit_rows(d, dx0, dy0, dx1, dy1, s, sx0, sy0, sx1, sy1, keyed, key_lo, key_hi); return; }
+    int32_t y0 = sy0 < 0 ? 0 : sy0, y1 = sy1 > (int32_t)s->h ? (int32_t)s->h : sy1;
+    if (y1 <= y0) return;
+    Surf tmp = *s;
+    tmp.mem = heap_alloc(s->pitch * s->h, 0);
+    memcpy(G + tmp.mem + y0 * s->pitch, G + s->mem + y0 * s->pitch, (size_t)(y1 - y0) * s->pitch);
+    blit_rows(d, dx0, dy0, dx1, dy1, &tmp, sx0, sy0, sx1, sy1, keyed, key_lo, key_hi);
+    heap_free(tmp.mem);
+}
+static void blit_rows(Surf *d, int32_t dx0, int32_t dy0, int32_t dx1, int32_t dy1, Surf *s, int32_t sx0, int32_t sy0, int32_t sx1, int32_t sy1,
+                      int keyed, uint32_t key_lo, uint32_t key_hi) {
     int32_t dw = dx1 - dx0, dh = dy1 - dy0, sw = sx1 - sx0, sh = sy1 - sy0;
     if (dw <= 0 || dh <= 0 || sw <= 0 || sh <= 0) return;
     int same = d->bpp == s->bpp && dw == sw && dh == sh && !keyed;
@@ -452,12 +479,55 @@ static void blit(Surf *d, int32_t dx0, int32_t dy0, int32_t dx1, int32_t dy1, Su
         }
     }
 }
+// The last 512 Blt/BltFast calls, for the F12 debug dump.
+static struct { uint64_t t; char kind; unsigned dst, src; int32_t dx0, dy0, dx1, dy1, sx0, sy0, sx1, sy1; uint32_t flags; } blts[512];
+static unsigned n_blts;
+static void blt_log(char kind, unsigned dst, unsigned src, int32_t dx0, int32_t dy0, int32_t dx1, int32_t dy1,
+                    int32_t sx0, int32_t sy0, int32_t sx1, int32_t sy1, uint32_t flags) {
+    unsigned i = n_blts++ % 512;
+    blts[i].t = host_ticks(); blts[i].kind = kind; blts[i].dst = dst; blts[i].src = src; blts[i].flags = flags;
+    blts[i].dx0 = dx0; blts[i].dy0 = dy0; blts[i].dx1 = dx1; blts[i].dy1 = dy1;
+    blts[i].sx0 = sx0; blts[i].sy0 = sy0; blts[i].sx1 = sx1; blts[i].sy1 = sy1;
+}
+// F12 in the window: every display-sized surface as PNG, and the recent blits, into user_dir/debug/.
+void ddraw_debug_dump(void) {
+    char dir[1100], path[1200];
+    snprintf(dir, sizeof dir, "%s/debug", user_dir);
+    mkdir(dir, 0755);
+    for (unsigned i = 0; i < 4096; ++i) {
+        Surf *s = surf_get(i);
+        if (!s || s->w < 320 || s->h < 200 || (s->bpp != 16 && s->bpp != 32)) continue;
+        uint32_t *buf = malloc(4 * s->w * s->h);
+        present_rgb(s, buf);
+        snprintf(path, sizeof path, "%s/surface_%u_%ux%u_caps%X.png", dir, i, s->w, s->h, s->caps);
+        png_write(path, (uint8_t *)buf, s->w, s->h, 4 * s->w);
+        free(buf);
+    }
+    snprintf(path, sizeof path, "%s/blits.txt", dir);
+    FILE *f = fopen(path, "w");
+    if (f) {
+        fprintf(f, "# oldest first: kind dst<-src  dst rect  src rect  flags  ms before the dump\n");
+        uint64_t now = host_ticks();
+        unsigned start = n_blts > 512 ? n_blts - 512 : 0;
+        for (unsigned k = start; k < n_blts; ++k) {
+            unsigned i = k % 512;
+            fprintf(f, "%c #%u<-#%d  (%d,%d)-(%d,%d)  (%d,%d)-(%d,%d)  %08X  %llu\n", blts[i].kind, blts[i].dst,
+                    blts[i].src == 0xFFFF ? -1 : (int)blts[i].src, blts[i].dx0, blts[i].dy0, blts[i].dx1, blts[i].dy1,
+                    blts[i].sx0, blts[i].sy0, blts[i].sx1, blts[i].sy1, blts[i].flags,
+                    (unsigned long long)((now - blts[i].t) / 1000000));
+        }
+        fclose(f);
+    }
+    printf("boot: debug dump -> %s\n", dir);
+    fflush(stdout);
+}
 static int surf_blt(Cpu *c) {                   // (dst rect, src surface, src rect, flags, DDBLTFX*)
     Surf *d = this_surf(c);
     uint32_t flags = arg(c, 4), fx = arg(c, 5);
     int32_t dx0, dy0, dx1, dy1;
     rect_of(arg(c, 1), d, &dx0, &dy0, &dx1, &dy1);
     if (flags & 0x400 || flags & 0x02000000) {             // DDBLT_COLORFILL / DDBLT_DEPTHFILL
+        blt_log('F', (unsigned)(d - surfs), 0xFFFF, dx0, dy0, dx1, dy1, 0, 0, 0, 0, flags);
         uint32_t v = M32(fx + 80);
         for (int32_t y = dy0 < 0 ? 0 : dy0; y < dy1 && y < (int32_t)d->h; ++y)
             for (int32_t x = dx0 < 0 ? 0 : dx0; x < dx1 && x < (int32_t)d->w; ++x) px_set(d, x, y, v);
@@ -467,6 +537,7 @@ static int surf_blt(Cpu *c) {                   // (dst rect, src surface, src r
     if (!s) RET(DDERR_INVALIDPARAMS, 6);
     int32_t sx0, sy0, sx1, sy1;
     rect_of(arg(c, 3), s, &sx0, &sy0, &sx1, &sy1);
+    blt_log('B', (unsigned)(d - surfs), (unsigned)(s - surfs), dx0, dy0, dx1, dy1, sx0, sy0, sx1, sy1, flags);
     int keyed = 0;
     uint32_t lo = 0, hi = 0;
     if (flags & 0x8000) { keyed = 1; lo = s->ck_src_lo; hi = s->ck_src_hi; }                  // DDBLT_KEYSRC
@@ -482,6 +553,7 @@ static int surf_blt_fast(Cpu *c) {              // (x, y, src, src rect, trans)
     int32_t sx0, sy0, sx1, sy1;
     rect_of(arg(c, 4), s, &sx0, &sy0, &sx1, &sy1);
     int32_t x = arg(c, 1), y = arg(c, 2);
+    blt_log('f', (unsigned)(d - surfs), (unsigned)(s - surfs), x, y, x + (sx1 - sx0), y + (sy1 - sy0), sx0, sy0, sx1, sy1, arg(c, 5));
     int keyed = (arg(c, 5) & 1) != 0;                      // DDBLTFAST_SRCCOLORKEY
     blit(d, x, y, x + (sx1 - sx0), y + (sy1 - sy0), s, sx0, sy0, sx1, sy1, keyed, s->ck_src_lo, s->ck_src_hi);
     if (d->caps & 0x200) present(d);

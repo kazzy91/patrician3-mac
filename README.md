@@ -5,9 +5,25 @@ the static-recompilation approach of [nfs-most-wanted-mac](https://github.com/el
 the game's own 32-bit x86 code is translated to C ahead of time and compiled for arm64. Native host code then
 replaces Win32 / DirectDraw / Miles. There is no Wine, CrossOver or emulator involved.
 
-**Status: a new game starts and runs in a Mac window.** `Patrician3.exe` and five of its DLLs are recompiled to
-arm64. The game boots natively, shows its menus, and a single-player game loads into the town view at 1280x1024.
-Playing has barely been tested, and there is no sound. See [docs/BOOT.md](docs/BOOT.md) and [docs/SPIKE.md](docs/SPIKE.md).
+**Status: playable.** `Patrician3.exe` and five of its DLLs are recompiled to arm64. The game runs natively in a
+Mac window at 1280x1024 with sound: menus, towns, the trading screens and moving between towns work in hand play.
+See [docs/BOOT.md](docs/BOOT.md) and [docs/SPIKE.md](docs/SPIKE.md).
+
+## Install
+
+1. Have Patrician III installed somewhere on the Mac, for example in a CrossOver bottle. Setup supports the English
+   retail CD version (it checks the files' hashes, `manifest/hashes.tsv`).
+2. Open `Patrician-III-Setup-<version>.dmg` and run **Patrician III Setup**. The first time, macOS may block it
+   because it isn't notarized: open System Settings > Privacy & Security and click **Open Anyway**.
+3. Setup finds a CrossOver install by itself, or click **Choose Folder…**. Click **Build and Install**. Setup checks
+   your files, translates and compiles the game on this Mac (about 2 minutes, with Apple's Command Line Tools; Setup
+   offers to install them), and puts **Patrician III.app** in Applications. The app holds its own copy of the game
+   files, so it doesn't need CrossOver afterwards.
+
+Saves and settings: `~/Library/Application Support/patrician3-mac`. Log: `~/Library/Logs/Patrician III.log`.
+Apple silicon only.
+
+Make the disk image with `scripts/make_dmg.sh` (→ `out/Patrician-III-Setup-<version>.dmg`).
 
 You need your own copy of the game. This repository contains no game code, data or generated C. It holds only the
 tooling and a manifest of function addresses.
@@ -21,10 +37,12 @@ tooling and a manifest of function addresses.
 | `recomp/p3_build.py` | Translates every function of a module and compiles them → `out/build/<module>/<module>.a` + `report.txt` |
 | `recomp/difftest.py` | Differential tests: translated C vs the original x86 code under Unicorn, on random states |
 | `manifest/functions_ghidra.tsv`, `manifest/<module>_functions.tsv` | Function starts from Ghidra's analysis (addresses and names only) |
-| `runtime/` | Runtime: loader, dispatch, Win32 (KERNEL32, USER32/GDI32, registry, files), DirectDraw, Miles (silent), the Mac window and input |
+| `runtime/` | Runtime: loader, dispatch, Win32 (KERNEL32, USER32/GDI32, registry, files), DirectDraw, Miles (CoreAudio), the Mac window and input |
 | `manifest/bases.tsv` | Load addresses for DLLs that share a base with another module |
 | `ghidra/ExportFunctions.java` | Ghidra post-script that writes the manifest |
-| `scripts/` | `setup.sh` (Python venv), `build.sh`, `ghidra_export.sh`, `fork_recomp.py` (how the fork was made) |
+| `scripts/` | `setup.sh` (Python venv), `build.sh`, `app.sh` (the .app), `icon.py` (the game's icon), `make_dmg.sh`, `ghidra_export.sh`, `fork_recomp.py` (how the fork was made) |
+| `setup/` | The Setup app (`Setup.m`) and the build it runs (`install.sh`) |
+| `manifest/hashes.tsv` | SHA-256 of the supported game files |
 
 ## Build the spike
 

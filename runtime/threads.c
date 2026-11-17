@@ -74,7 +74,9 @@ static void park_if_suspended(void) {
 }
 void gil_maybe_yield(void) {
     static unsigned n;
-    if (++n & 0xFF) return;
+    static int off = -1;
+    if (off < 0) off = getenv("P3_NO_YIELD") != NULL;   // threads then switch only when one sleeps or waits
+    if (off || ++n & 0xFF) return;
     pthread_mutex_lock(&m);
     int waiters = next_ticket != serving;
     if (waiters) { unlock_locked(); lock_locked(); }

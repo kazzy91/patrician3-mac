@@ -25,7 +25,7 @@ clang -arch arm64 -O1 -g -Wall -Wno-unused-function -Wno-misleading-indentation 
     -I recomp -I runtime \
     runtime/boot.c runtime/heap.c runtime/files.c runtime/kernel32.c runtime/user32.c runtime/misc.c runtime/registry.c \
     runtime/display.c runtime/com.c runtime/ddraw.c runtime/d3d.c runtime/png.c runtime/extra.c runtime/mss32.c \
-    runtime/input.c runtime/threads.c runtime/window.m \
-    $B/modules.c $LIBS -lz -framework Cocoa -framework Metal -framework QuartzCore \
+    runtime/input.c runtime/threads.c runtime/eh.c runtime/window.m \
+    $B/modules.c $LIBS -lz -framework Cocoa -framework Metal -framework QuartzCore -framework AudioToolbox -framework CoreAudio \
     -Wl,-stack_size,0x4000000 -o out/boot
 echo "ok: out/boot (modules: $MODS)"

@@ -33,7 +33,16 @@ int win32_misc(Cpu *c, const char *dll, const char *fn) {
         return 0;
     }
     if (!strcasecmp(dll, "SHLWAPI.dll")) {
-        F("PathMatchSpecA") RET(fnmatch(gptr(arg(c, 1)), gptr(arg(c, 0)), FNM_CASEFOLD) == 0, 2);
+        F("PathMatchSpecA") {                  // (file, spec): Windows wildcards; '\\' is a path separator, not an escape
+            char spec[1024];
+            snprintf(spec, sizeof spec, "%s", gptr(arg(c, 1)));
+            int hit = 0;
+            for (char *p = strtok(spec, ";"); p && !hit; p = strtok(NULL, ";")) {
+                while (*p == ' ') ++p;
+                hit = fnmatch(p, gptr(arg(c, 0)), FNM_CASEFOLD | FNM_NOESCAPE) == 0;
+            }
+            RET(hit, 2);
+        }
         return 0;
     }
     if (!strcasecmp(dll, "comdlg32.dll")) {

@@ -7,13 +7,15 @@ cd "$(dirname "$0")/.."
 GAME="${1:-$P3_GAME}"
 [ -n "$GAME" ] || { echo "usage: scripts/build.sh /path/to/Patrician III" >&2; exit 2; }
 [ -f "$GAME" ] && GAME=$(dirname "$GAME")
-[ -x .venv/bin/python ] || scripts/setup.sh
+# P3_PYTHON: a Python 3.9+ with capstone (the Setup app passes the system one); default: the .venv
+PY=${P3_PYTHON:-.venv/bin/python}
+[ -n "$P3_PYTHON" ] || [ -x .venv/bin/python ] || scripts/setup.sh
 # case-insensitive file lookup in the game folder
 find_file() { find "$GAME" -maxdepth 1 -iname "$1" | head -1; }
-.venv/bin/python recomp/p3_build.py --exe "$(find_file Patrician3.exe)" --module p3
+"$PY" recomp/p3_build.py --exe "$(find_file Patrician3.exe)" --module p3
 for f in manifest/*_functions.tsv; do
     [ -e "$f" ] || continue
     m=$(basename "$f" _functions.tsv)
     base=$(awk -v m="$m" '$1 == m { print $2 }' manifest/bases.tsv)
-    .venv/bin/python recomp/p3_build.py --exe "$(find_file "$m.dll")" --module "$m" ${base:+--base $base}
+    "$PY" recomp/p3_build.py --exe "$(find_file "$m.dll")" --module "$m" ${base:+--base $base}
 done

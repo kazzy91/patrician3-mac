@@ -1,7 +1,7 @@
 // heap.c - guest heap for HeapAlloc / GlobalAlloc / LocalAlloc / VirtualAlloc.
 //
 // Bump allocation in [HEAP_BASE, HEAP_END) with power-of-two size classes and per-class free lists. Each block has a
-// 16-byte header just below it: requested size, class, magic. Simple, but enough to boot; the NFS port's slab heap
+// 16-byte header just below it: requested size, class, magic, and a Windows-like heap entry word (see heap_alloc). Simple, but enough to boot; the NFS port's slab heap
 // can replace it if fragmentation shows up.
 #include <stdlib.h>
 
@@ -9,22 +9,30 @@
 
 #define MAGIC 0x50334850u          // "P3HP"
 static uint32_t next = HEAP_BASE;
-static uint32_t free_head[33];     // per log2 class: guest address of the first free block (0 = empty)
-
+// Reuse as Windows XP's heap does for the game's objects: a freed small block (under 1 KB) comes back, most recently
+// freed first, only for an allocation of the same size in 8-byte steps; larger blocks use power-of-two classes (so
+// growing buffers often stay in place on realloc). Patrician III depends on both sides of this:
+//   - it keeps stale pointers to freed walkers of the previous town; reused for an object of another size, they read
+//     garbage (out-of-range object ids, crashes when a second town loaded);
+//   - its renderer frees and reallocates same-size objects and expects the same block back.
+#define SMALL 128                  // classes 1..128: 8..1024 bytes
+static uint32_t free_head[SMALL + 33];
+static uint32_t class_size(unsigned k) { return k <= SMALL ? 8u * k : 1u << (k - SMALL); }
 static unsigned class_of(uint32_t n) {
-    unsigned k = 4;                // 16 bytes minimum
+    if (n <= 8u * SMALL) return n ? (n + 7) / 8 : 1;
+    unsigned k = 11;
     while ((1u << k) < n) ++k;
-    return k;
+    return SMALL + k;
 }
 
 uint32_t heap_alloc(uint32_t n, int zero) {
     unsigned k = class_of(n ? n : 1);
-    if (k > 31) die("heap_alloc(%u): too large", n);
+    if (k > SMALL + 31) die("heap_alloc(%u): too large", n);
     uint32_t a = free_head[k];
     if (a) {
         free_head[k] = M32(a);
     } else {
-        uint32_t need = 16 + (1u << k);
+        uint32_t need = 16 + class_size(k);
         if ((uint64_t)next + need > HEAP_END) die("guest heap full (%u MB used)", (next - HEAP_BASE) >> 20);
         a = next + 16;
         next += need;
@@ -32,7 +40,13 @@ uint32_t heap_alloc(uint32_t n, int zero) {
     M32(a - 16) = n;
     M32(a - 12) = k;
     M32(a - 8) = MAGIC;
-    if (zero) memset(G + a, 0, n);
+    // The dword just before a block, as Windows XP's heap leaves it: SmallTagIndex 0, Flags = busy, UnusedBytes,
+    // SegmentIndex 0. The game reads it: an empty list (scripts\buttons.ini is missing from the game data) is indexed
+    // at -1, and Windows hands back this header word, never 0. A zero here made the game divide by zero.
+    M32(a - 4) = 0x0100u | (uint32_t)(((n ? (8 - n % 8) % 8 : 0) + 8) & 0xFF) << 16;
+    static int always = -1;
+    if (always < 0) always = getenv("P3_HEAP_ZERO") != NULL;   // test: does the game rely on fresh memory being zero?
+    if (zero || always) memset(G + a, 0, n);
     return a;
 }
 
@@ -43,8 +57,11 @@ static int valid(uint32_t a) {
 void heap_free(uint32_t a) {
     if (!a) return;
     if (!valid(a)) { trace("  heap_free(%08X): not a heap block, ignored\n", a); return; }
+    static int keep = -1;
+    if (keep < 0) keep = getenv("P3_HEAP_NOREUSE") != NULL;   // test: freed blocks are never reused (stale pointers keep their data)
+    if (keep) return;
     unsigned k = M32(a - 12);
-    M32(a - 8) = 0;
+    M32(a - 8) = 0;                                        // no longer a valid block (double frees are ignored)
     M32(a) = free_head[k];
     free_head[k] = a;
 }
@@ -55,7 +72,7 @@ uint32_t heap_realloc(uint32_t a, uint32_t n, int zero) {
     if (!a) return heap_alloc(n, zero);
     if (!valid(a)) return 0;
     uint32_t old = M32(a - 16);
-    if (n <= (1u << M32(a - 12))) {          // fits in place
+    if (n <= class_size(M32(a - 12))) {      // fits in place
         if (zero && n > old) memset(G + a + old, 0, n - old);
         M32(a - 16) = n;
         return a;

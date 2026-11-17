@@ -32,22 +32,34 @@ Environment switches:
 - `BOOT_TIMEOUT=s`: stop after s seconds.
 - `BOOT_COUNTS=file`: how often each import was called.
 - `BOOT_USERDATA=dir`: use this folder instead of `~/Library/Application Support/patrician3-mac`.
+- `P3_MUTE=1`: no sound.
+- `P3_NO_CATCH=1`: a hardware exception stops the run instead of reaching the game's `catch(...)`.
+- Heap tests: `P3_HEAP_ZERO=1` (every allocation zeroed), `P3_HEAP_NOREUSE=1` (freed blocks never reused).
+- `P3_WATCH`: report writes to a guest address (see `boot.c`).
+
+Started without a folder (as `Patrician III.app` does), `boot` uses the game files in the app's
+`Contents/Resources/Game` and writes its log to `~/Library/Logs/Patrician III.log`.
 
 The game folder is only read. Everything the game writes (settings, the registry, saves) goes to the user folder,
 and reads look there first.
 
 ## Where it stands
 
-**A new single-player game starts and runs.** A scripted Single Game -> Start loads Luebeck at 1280x1024x32 and the
-town view runs for a minute without stopping (people, date and gold display, minimap). Checked so far:
-- Menus by script and by hand (real mouse clicks reached the game in a user run).
+**Playable.** A long hand-played session had no crash: menus, the town view with scrolling, buildings (the bath),
+sound and music, and moving between towns, including going back to a town already visited.
 - The Metal picture, read back from the drawable, is correct at Retina size.
-- Not checked: playing (trading, sailing, dialogs), saving and loading, videos, keyboard typing.
+- Not checked yet: saving and loading, long sea voyages, videos, keyboard typing.
 
-Known problems:
-- Three divide-by-zero sites are hit and skipped (`#DE` in the log): 0x42698C once, then 0x423FBB about 30 times a
-  second, 0x4AF82A once. A count that should be non-zero comes back 0 (`0x100 / f_004C5850(...)`); cause not found yet.
-- No sound (Miles is silent).
+Fixed since the first in-game runs:
+- Divide-by-zero in button animations: `PathMatchSpecA` treated `\` as an escape, so wildcard texture lists
+  (`images\frames_konto\konto00*.tga`) matched nothing in the archive. Those empty textures led to the divides and
+  to the crash when leaving town.
+- Hardware exceptions now reach C++ `catch(...)` as on Windows (`runtime/eh.c`, resumable functions from the build).
+- Sound: Miles on CoreAudio (`runtime/mss32.c`).
+- Crashes when a second town loaded: the game keeps pointers to freed objects of the previous town, and the heap
+  handed those blocks out for objects of another size. `heap.c` now reuses blocks as Windows XP does: a freed block
+  under 1 KB comes back, most recently freed first, only for the same size in 8-byte steps (the renderer also
+  expects that same block back). Larger blocks use power-of-two classes.
 
 ```
 boot: display 1280x1024x32
@@ -105,7 +117,7 @@ Resolutions above the game's own table would need changes to its mode table and 
   - `d3d.c` reports Direct3D requests; the menu doesn't use 3D.
 - **Threads:** `threads.c`. Each guest thread is a pthread with its own CPU state, stack and TEB; one global lock lets
   one run at a time, handed over at sleeps and waits. TLS, critical sections and events live there too.
-- **Miles audio:** `mss32.c` provides working handles and file loading, plays nothing, and reports every sound as finished.
+- **Miles audio:** `mss32.c` mixes samples and streams on a CoreAudio output unit; MP3 and WAV are decoded with ExtAudioFile.
 - **Window and input**
   - `window.m`: a Cocoa window with a Metal layer. The game runs on the main thread and never returns to a Cocoa run
     loop, so events are taken by hand whenever the game calls `PeekMessage`, `GetMessage` or `Sleep`. Each presented
@@ -131,10 +143,8 @@ only catches stores to absolute addresses; a store through a register into code 
 
 ## Next
 
-1. **Play by hand** and note where it stops; the log names the missing piece.
-2. **The divide-by-zero sites** above.
-3. **Audio:** Miles streams and samples on CoreAudio.
-4. **Structured exceptions and C++ `throw`:** `RaiseException`/`RtlUnwind` stop the run if reached.
-5. **Direct3D:** requested by the renderer (`IDirect3DTexture2` from a surface) and refused; the game falls back to 2D. Not needed so far.
-6. **`SchnellTransfer.dll` (LAN):** not loaded.
-7. **An app bundle,** so the game has its own name and icon (it shows as "boot" now).
+1. **Play more by hand** and note where it stops; the log names the missing piece.
+2. **Direct3D:** requested by the renderer (`IDirect3DTexture2` from a surface) and refused; the game falls back to 2D.
+3. **`SchnellTransfer.dll` (LAN):** not loaded.
+4. **Videos** (`Vto.dll`, `.sks`): untested.
+5. **Notarization** of the Setup app, so macOS opens it without the Privacy & Security step.

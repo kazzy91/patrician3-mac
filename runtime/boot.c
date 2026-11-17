@@ -9,6 +9,7 @@
 //   ./boot "/path/to/Patrician III"     (BOOT_TRACE=1: every import call; BOOT_TIMEOUT=s; BOOT_COUNTS=file)
 #include <dirent.h>
 #include <errno.h>
+#include <mach-o/dyld.h>
 #include <mach/mach_time.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -54,9 +55,54 @@ void trace(const char *fmt, ...) {
 // this is a write to a read-only host page, a stack overflow, or a bug in the host layer. Reports the guest address
 // when the fault is inside guest memory, and the host call stack (translated functions are named f_<guest address>).
 #include <execinfo.h>
+#include <dlfcn.h>
+// Write watch (debugging): the page of one guest cell is made read-only; each write faults here, the writer's host
+// stack is kept, the page is opened again, and watch_check() (at the next import call) closes it after looking at
+// the cell. Reports the writers when the cell holds a bad value again.
+static uint32_t watch_cell, watch_limit;
+static uintptr_t watch_page;
+static volatile int watch_open;
+static void *watch_frames[16][8];
+static int watch_nframes[16], watch_n;
+static void watch_arm(void) {
+    if (watch_page) mprotect((void *)watch_page, (size_t)getpagesize(), PROT_READ);
+    watch_open = 0;
+}
+void watch_start(uint32_t cell, uint32_t limit) {
+    if (watch_cell) return;
+    watch_cell = cell; watch_limit = limit;
+    watch_page = (uintptr_t)(G + cell) & ~(uintptr_t)(getpagesize() - 1);
+    fprintf(stderr, "boot: watching writes to the cell at %08X (bad if its id >= %u)\n", cell, limit);
+    watch_arm();
+}
+static void watch_check(void) {
+    if (!watch_open) return;
+    if (M16(watch_cell) >= watch_limit) {
+        static int reported;
+        if (reported++ < 3) {
+            fprintf(stderr, "boot: cell %08X became %08X; the last writes to its page came from:\n", watch_cell, M32(watch_cell));
+            for (int k = 0; k < watch_n; ++k) {
+                fprintf(stderr, "   write %d:", k);
+                for (int j = 1; j < watch_nframes[k]; ++j) {
+                    Dl_info di;
+                    if (dladdr(watch_frames[k][j], &di) && di.dli_sname) fprintf(stderr, " %s", di.dli_sname);
+                }
+                fprintf(stderr, "\n");
+            }
+        }
+    }
+    watch_n = 0;
+    watch_arm();
+}
 static void on_fault(int sig, siginfo_t *info, void *ctx) {
     (void)ctx;
     uintptr_t a = (uintptr_t)info->si_addr, g = (uintptr_t)G;
+    if (watch_page && a >= watch_page && a < watch_page + (uintptr_t)getpagesize()) {
+        if (watch_n < 16) { watch_nframes[watch_n] = backtrace(watch_frames[watch_n], 8); ++watch_n; }
+        mprotect((void *)watch_page, (size_t)getpagesize(), PROT_READ | PROT_WRITE);
+        watch_open = 1;
+        return;                                            // the store runs again, now allowed
+    }
     fprintf(stderr, "boot: host fault (signal %d) at %p", sig, info->si_addr);
     if (G && a >= g && a < g + (1ull << 32)) fprintf(stderr, " = guest address %08X", (uint32_t)(a - g));
     fprintf(stderr, "; %u import calls, last %s\n", import_calls, last_import);
@@ -75,7 +121,40 @@ static void on_timeout(int sig) {
 void untranslated(Cpu *c, uint32_t addr) { (void)c; die("reached untranslated code at %08X", addr); }
 void bad_jump(Cpu *c, uint32_t at) { (void)c; die("jump table index out of range at %08X", at); }
 void guest_breakpoint(Cpu *c, uint32_t at) { (void)c; trace("  int3 at %08X (continuing)\n", at); }
-void guest_divide_error(Cpu *c, uint32_t at) { (void)c; fprintf(stderr, "boot: #DE (divide error) at %08X, continuing\n", at); }
+int eh_raise(Cpu *c, uint32_t code, uint32_t at);   // eh.c
+// Registers, the SEH chain, and the heap memory the registers point at (two levels): for crash reports.
+static void dump_state(Cpu *c) {
+    fprintf(stderr, "      eax %08X ebx %08X ecx %08X edx %08X esi %08X edi %08X ebp %08X esp %08X  [esp] %08X %08X %08X\n",
+            c->eax, c->ebx, c->ecx, c->edx, c->esi, c->edi, c->ebp, c->esp, M32(c->esp), M32(c->esp + 4), M32(c->esp + 8));
+    fprintf(stderr, "      SEH chain:");
+    for (uint32_t r = M32(c->fs_base), k = 0; r && r != 0xFFFFFFFF && k < 12; r = M32(r), ++k)
+        fprintf(stderr, " [%08X handler %08X scope %08X try %d]", r, M32(r + 4), M32(r + 8), (int32_t)M32(r + 12));
+    fprintf(stderr, "\n");
+    uint32_t regs[] = {c->eax, c->ebx, c->ecx, c->edx, c->esi, c->edi, c->ebp};
+    const char *rn[] = {"eax", "ebx", "ecx", "edx", "esi", "edi", "ebp"};
+    for (int r = 0; r < 7; ++r)
+        if (regs[r] >= HEAP_BASE && regs[r] < HEAP_END) {
+            fprintf(stderr, "      [%s %08X]", rn[r], regs[r]);
+            for (int k = 0; k < 12; ++k) fprintf(stderr, " %08X", M32(regs[r] + 4 * k));
+            fprintf(stderr, "\n");
+            for (int k = 0; k < 6; ++k) {
+                uint32_t p = M32(regs[r] + 4 * k);
+                if (p < HEAP_BASE || p >= HEAP_END) continue;
+                fprintf(stderr, "        +%02X -> %08X:", 4 * k, p);
+                for (int j = -2; j < 10; ++j) fprintf(stderr, " %08X", M32(p + 4 * j));
+                fprintf(stderr, "\n");
+            }
+        }
+}
+void guest_divide_error(Cpu *c, uint32_t at) {   // reported once per site, with the registers
+    if (!getenv("P3_NO_CATCH")) eh_raise(c, 0xC0000094u, at);   // EXCEPTION_INT_DIVIDE_BY_ZERO: a catch(...) takes it, as on Windows
+    static uint32_t seen[64];
+    static unsigned n;
+    for (unsigned i = 0; i < n; ++i) if (seen[i] == at) return;
+    if (n < 64) seen[n++] = at;
+    fprintf(stderr, "boot: #DE (divide error) at %08X, continuing (reported once)\n", at);
+    dump_state(c);
+}
 void host_cpuid(Cpu *c) {
     // A generic Pentium III class CPU: FPU, TSC, CX8, CMOV, MMX. No SSE (the translator handles MMX only).
     switch (c->eax) {
@@ -134,6 +213,7 @@ static int import_cmp(const void *a, const void *b) {
 
 // ---------------- host functions and guest calls ----------------
 static HostFn host_fns[4096];
+static uint64_t host_fn_calls[4096];
 static const char *host_fn_names[4096];
 static unsigned host_fn_count;
 uint32_t host_fn(HostFn fn, const char *name) {
@@ -161,6 +241,7 @@ void dispatch(Cpu *c, uint32_t t) {
     if (t >= HOSTFN_BASE && t < HOSTFN_BASE + 4 * host_fn_count) {
         unsigned i = (t - HOSTFN_BASE) / 4;
         trace("  [host] %s  [from %08X]\n", host_fn_names[i], M32(c->esp));
+        ++host_fn_calls[i];
         if (!host_fns[i](c)) die("not implemented yet: %s (called from %08X)", host_fn_names[i], M32(c->esp));
         return;
     }
@@ -177,6 +258,42 @@ void dispatch(Cpu *c, uint32_t t) {
             if (m->func_addr[mid] < t) lo = mid + 1; else hi = mid - 1;
         }
     }
+    // Guarded call sites: a known game-data problem makes the game call through a broken object here. Skip the call as
+    // if it returned 0 (popping its return address and arguments), log it once per site, and carry on.
+    static const struct { uint32_t ret, arg_bytes; const char *why; } guards[] = {
+        {0x00591E1D, 4, "town object layer holds an out-of-range object id (Rostock: 0x3260)"},
+        {0x0059155B, 4, "town object layer holds an out-of-range object id (Rostock: 0x3260)"},
+    };
+    for (unsigned g = 0; g < sizeof guards / sizeof *guards; ++g)
+        if (M32(c->esp) == guards[g].ret) {
+            static uint8_t told[8];
+            if (!told[g]) { told[g] = 1; fprintf(stderr, "boot: guard at %08X: skipped call to %08X (%s); reported once\n", guards[g].ret, t, guards[g].why); }
+            // The town view (esi): clear every out-of-range id in its object layer, so no other code meets one.
+            uint32_t layer = M32(c->esi + 0xC310), tab = M32(c->esi + 0x3FC);
+            uint32_t cells = heap_size(layer), ids = heap_size(tab);
+            if (cells != 0xFFFFFFFFu && ids != 0xFFFFFFFFu) {
+                unsigned fixed = 0;
+                for (uint32_t k = 0; k < cells / 4; ++k)
+                    if (M16(layer + 4 * k) >= ids / 4) {
+                        if (getenv("P3_WATCH")) watch_start(layer + 4 * k, ids / 4);
+                        M16(layer + 4 * k) = 0; ++fixed;
+                    }
+                if (fixed) fprintf(stderr, "boot: guard: cleared %u out-of-range object id(s) in the town object layer (%u cells, %u ids)\n", fixed, cells / 4, ids / 4);
+            }
+            c->eax = 0;
+            c->esp += 4 + guards[g].arg_bytes;
+            return;
+        }
+    fprintf(stderr, "boot: indirect call to %08X, which is not a known function (return address %08X)\n", t, M32(c->esp));
+    dump_state(c);
+    if (M32(c->esp) == 0x00591E1D) {                       // the town-object lookup in FUN_00591C50
+        uint32_t tab = M32(c->esi + 0x3FC), idx = M16(c->ebp);
+        fprintf(stderr, "      table [esi+3FC] = %08X (heap block %u bytes = %u entries), index %u (record %08X: %08X %08X)\n",
+                tab, M32(tab - 16), M32(tab - 16) / 4, idx, c->ebp, M32(c->ebp), M32(c->ebp + 4));
+        fprintf(stderr, "      [esi+3F0..40C]:");
+        for (int k = -3; k < 5; ++k) fprintf(stderr, " %08X", M32(c->esi + 0x3FC + 4 * k));
+        fprintf(stderr, "\n");
+    }
     die("indirect call to %08X, which is not a known function (return address %08X)", t, M32(c->esp));
 }
 
@@ -186,6 +303,8 @@ static void write_call_counts(void) {
     if (!f) return;
     for (unsigned i = 0; i < n_imports; ++i)
         if (imports[i].calls) fprintf(f, "%10llu  %s\n", (unsigned long long)imports[i].calls, imports[i].name);
+    for (unsigned i = 0; i < host_fn_count; ++i)
+        if (host_fn_calls[i]) fprintf(f, "%10llu  %s\n", (unsigned long long)host_fn_calls[i], host_fn_names[i]);
     fclose(f);
 }
 
@@ -196,6 +315,7 @@ static void import_call(Cpu *c, unsigned index) {
     snprintf(dll, sizeof dll, "%.*s", (int)(bang - name), name);
     ++import_calls;
     ++imports[index].calls;
+    if (watch_open) watch_check();
     last_import = name;
     uint32_t ra = M32(c->esp), a0 = arg(c, 0), a1 = arg(c, 1), a2 = arg(c, 2), a3 = arg(c, 3);
     gil_maybe_yield();
@@ -302,8 +422,29 @@ int module_init(Cpu *c, const ModuleTables *m) {
 }
 
 int main(int argc, char **argv) {
-    if (argc < 2) { fprintf(stderr, "usage: %s \"/path/to/Patrician III\"\n", argv[0]); return 2; }
-    game_dir = argv[1];
+    // From a terminal: out/boot "/path/to/Patrician III". From the app: the game files are in Contents/Resources/Game
+    // (Setup copies them there) and the log goes to ~/Library/Logs/Patrician III.log.
+    static char bundled[1024];
+    if (argc < 2 || argv[1][0] == '-') {
+        char exe[1024], real[1024];
+        uint32_t n = sizeof exe;
+        if (_NSGetExecutablePath(exe, &n) || !realpath(exe, real)) die("cannot find the program's own path");
+        char *slash = strrchr(real, '/');
+        if (slash) *slash = 0;                                         // .../Contents/MacOS
+        snprintf(bundled, sizeof bundled, "%s/../Resources/Game", real);
+        struct stat st;
+        if (stat(bundled, &st)) { fprintf(stderr, "usage: %s \"/path/to/Patrician III\"\n", argv[0]); return 2; }
+        if (!isatty(1)) {                                              // started from Finder: stdout and stderr to the log
+            char log[1024];
+            snprintf(log, sizeof log, "%s/Library/Logs/Patrician III.log", getenv("HOME"));
+            if (freopen(log, "w", stdout)) {
+                dup2(fileno(stdout), 2);
+                setvbuf(stdout, NULL, _IOLBF, 0);
+                setvbuf(stderr, NULL, _IOLBF, 0);
+            }
+        }
+        game_dir = bundled;
+    } else game_dir = argv[1];
     boot_trace = getenv("BOOT_TRACE") != NULL;
     static char ud[1024];
     snprintf(ud, sizeof ud, "%s/Library/Application Support/patrician3-mac", getenv("HOME"));

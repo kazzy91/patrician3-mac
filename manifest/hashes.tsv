@@ -1,0 +1,8 @@
+# SHA-256 of the game files the manifests were made from (Patrician III, English, as installed from the retail CD).
+# Setup refuses other versions: their code is at different addresses, so the function lists would not match.
+Patrician3.exe	1f4012acf23f81b72f81506f46cc83967ff207af0de3025323750f9d2d676707
+archiver.dll	044e6d659f41b86a00c5429f66f127b7bd01012f39dff008faf4ebd6887bd114
+ddraw_dll.dll	c3572cc4ae450e23c201d9859f62ab34a0d71a2d16cf417e9199e7cdf7ccbf13
+AIM.dll	b2b45d61d3dc10bc3037e0dcfed12f3596f516f58dcc4d78a8c2e423cfe619c1
+Vto.dll	022770a6d837bf6f61d86803fe75a272167eb0691ef0db35398ba2c3fb061e1f
+ijl11.dll	5a0b1c4e5d91fd67a1ad23e5ce869899b79a7282cb6e5533dc5c074eb59306ec

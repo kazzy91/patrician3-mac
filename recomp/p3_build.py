@@ -272,6 +272,68 @@ def self_modifying(pe, code):
     return patched, targets
 
 
+def cxx_catch_all(pe, funcs):
+    """Functions with a C++ `catch(...)`, which on Windows (VC6) also catches hardware exceptions such as a divide by
+    zero. For each: (record offset, continuation addresses). The record offset is entry esp minus the address of the
+    function's EH registration record; the continuations are where its catch blocks return to (`mov eax, L; ret`).
+    The runtime (eh.c) resumes such a function at a continuation after running the catch block."""
+    md = Cs(CS_ARCH_X86, CS_MODE_32)
+    u32 = lambda a: struct.unpack("<I", pe.read(a, 4) or b"\0\0\0\0")[0]
+    out = {}
+    # A function's code ends at the next start that isn't one of its catch/unwind blocks (Ghidra splits those out).
+    real = sorted(x for x, _, n in funcs if not n.startswith(("Catch@", "Unwind@", "data_ref_", "call_target_", "smc_target_")))
+    import bisect
+    for a, limit, _ in funcs:
+        b = pe.read(a, 12) or b""
+        if b[:3] == b"\x6a\xff\x68":                   # push -1; push handler
+            k, h = 0xC, struct.unpack_from("<I", b, 3)[0]
+        elif b[:6] == b"\x55\x8b\xec\x6a\xff\x68":    # push ebp; mov ebp, esp; push -1; push handler
+            k, h = 0x10, struct.unpack_from("<I", b, 6)[0]
+        else:
+            continue
+        hb = pe.read(h, 10) or b""
+        if hb[:1] != b"\xb8" or hb[5:6] != b"\xe9":         # mov eax, FuncInfo; jmp __CxxFrameHandler
+            continue
+        fi = struct.unpack_from("<I", hb, 1)[0]
+        if u32(fi) != 0x19930520:
+            continue
+        ntry, tmap = u32(fi + 12), u32(fi + 16)
+        conts = set()
+        for t in range(min(ntry, 64)):
+            ncatch, harr = u32(tmap + 20 * t + 12), u32(tmap + 20 * t + 16)
+            for k2 in range(min(ncatch, 16)):
+                if u32(harr + 16 * k2 + 4) != 0:           # typed catch: not for hardware exceptions
+                    continue
+                cb, last = u32(harr + 16 * k2 + 12), None
+                for i in md.disasm(pe.read(cb, 0x400) or b"", cb):
+                    if i.mnemonic == "mov" and i.op_str.startswith("eax, 0x"):
+                        last = int(i.op_str.split(", ")[1], 16)
+                    if i.mnemonic.startswith("ret"):
+                        k3 = bisect.bisect_right(real, a)
+                        end = real[k3] if k3 < len(real) else 0xFFFFFFFF
+                        if last and a < last < end:      # may lie past the catch blocks, which split the function
+                            conts.add(last)
+                        break
+        if conts:
+            out[a] = (k, sorted(conts))
+    return out
+
+
+def resumable(addr, code, k, conts):
+    """Wraps a translated function so eh.c can re-enter it at a catch continuation (see cxx_catch_all)."""
+    head = f"void f_{addr:08X}(Cpu *restrict c) {{"
+    assert code.startswith(head)
+    entry = " ".join(f"case 0x{t:08X}u: goto L_{t:08X};" for t in conts)
+    body = code.replace(head, f"static void f_{addr:08X}_body(Cpu *restrict c, uint32_t resume_at) {{", 1)
+    first = body.index("\n    ABI_SAVE();") + len("\n    ABI_SAVE();")
+    body = body[:first] + f"\n    switch (resume_at) {{ {entry} default: break; }}" + body[first:]
+    return body + (f"\nvoid f_{addr:08X}(Cpu *c) {{\n"
+                   f"    EhFrame fr;\n    volatile uint32_t at = 0;\n"
+                   f"    eh_push(&fr, c->esp - 0x{k:X}u);\n"
+                   f"    if (_setjmp(fr.jb)) at = fr.resume;\n"
+                   f"    f_{addr:08X}_body(c, at);\n    eh_pop(&fr);\n}}")
+
+
 def rebase(src, new_base, dst):
     """Write a copy of the PE src with every HIGHLOW fixup of its .reloc table moved to new_base. Returns the count."""
     d = bytearray(open(src, "rb").read())
@@ -411,9 +473,20 @@ def main():
           f"(of which code immediates {n_imm}); rejected candidates: {rejected}; "
           f"direct-call targets Ghidra missed: {call_targets}")
 
+    catches = cxx_catch_all(pe, funcs)
+    # A catch continuation is a label inside its function, not a function of its own (the catch block's
+    # `mov eax, continuation` made it look like a code pointer).
+    conts = {t for k, ts in catches.values() for t in ts}
+    if conts & set(starts):
+        for t in conts:
+            if t in starts and starts[t].startswith(("data_ref_", "call_target_")):
+                del starts[t]
+        funcs = make_funcs(starts, code)
+    print(f"functions with catch(...): {len(catches)}")
     rc = recomp.Recompiler(pe=pe, functions={a: l for a, l, _ in funcs})
     rc.calls = True
     rc.patched = patched
+    rc.extra_labels = {a: set(conts) for a, (k, conts) in catches.items()}
     t0 = time.time()
     bodies, reasons, insns = [], collections.Counter(), 0
     partial_reasons = collections.Counter()
@@ -424,6 +497,13 @@ def main():
             code, why = rc.translate(a, limit)
         except Exception as e:  # translator assertion/bug: record and stub
             code, why = None, f"translator exception: {type(e).__name__}: {str(e)[:80]}"
+        if code is not None and a in catches:
+            missing = [t for t in catches[a][1] if f"L_{t:08X}:;" not in code]
+            if missing:
+                print(f"warning: {a:08X}: catch continuation(s) {missing} not reached by translation; not resumable")
+            else:
+                code = resumable(a, code, *catches[a])
+                stats["resumable functions (catch(...))"] += 1
         if code is None:
             reasons[why] += 1
             code = f"void f_{a:08X}(Cpu *c) {{ untranslated(c, 0x{a:08X}u); }} /* {name}: {why} */"
@@ -444,7 +524,9 @@ def main():
     print(f"translated in {time.time() - t0:.1f}s")
 
     with open(os.path.join(args.out, "funcs.h"), "w") as h:
-        h.write('#pragma once\n#include "runtime.h"\nvoid untranslated(Cpu *c, uint32_t addr);\n')
+        h.write('#pragma once\n#include "runtime.h"\n#include <setjmp.h>\nvoid untranslated(Cpu *c, uint32_t addr);\n')
+        h.write('typedef struct EhFrame { struct EhFrame *prev; uint32_t record, resume; jmp_buf jb; } EhFrame;\n'
+                'void eh_push(EhFrame *f, uint32_t record);\nvoid eh_pop(EhFrame *f);\n')
         h.writelines(f"void f_{a:08X}(Cpu *c);\n" for a, _, _ in bodies)
     with open(os.path.join(args.out, "table.c"), "w") as t:
         t.write('#include "funcs.h"\n')

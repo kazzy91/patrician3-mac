@@ -36,6 +36,7 @@ int png_write(const char *path, const uint8_t *pixels, int w, int h, int pitch);
 @implementation GameDelegate
 - (BOOL)windowShouldClose:(NSWindow *)w { input_request_close(); return NO; }
 - (void)quit:(id)sender { input_request_close(); }
+- (void)debugDump:(id)sender { void ddraw_debug_dump(void); ddraw_debug_dump(); }
 @end
 
 static int enabled;
@@ -69,6 +70,9 @@ void window_init(void) {
         [windowItem setSubmenu:window];
         [app addItemWithTitle:@"Hide Patrician III" action:@selector(hide:) keyEquivalent:@"h"];
         [app addItem:[NSMenuItem separatorItem]];
+        NSMenuItem *dump = [app addItemWithTitle:@"Save Debug Dump" action:@selector(debugDump:) keyEquivalent:@"D"];
+        dump.keyEquivalentModifierMask = NSEventModifierFlagCommand | NSEventModifierFlagShift;
+        dump.target = delegate;
         NSMenuItem *quit = [app addItemWithTitle:@"Quit Patrician III" action:@selector(quit:) keyEquivalent:@"q"];
         quit.target = delegate;
         NSMenuItem *fs = [window addItemWithTitle:@"Enter Full Screen" action:@selector(toggleFullScreen:) keyEquivalent:@"f"];
@@ -235,6 +239,11 @@ static BOOL handle(NSEvent *e) {
     case NSEventTypeKeyUp: {
         if (e.modifierFlags & NSEventModifierFlagCommand) return NO;     // menu shortcuts
         if (!win || !win.isKeyWindow) return NO;
+        if (e.keyCode == 0x6F) {                           // F12: debug dump (not passed to the game)
+            void ddraw_debug_dump(void);
+            if (e.type == NSEventTypeKeyDown && !e.isARepeat) ddraw_debug_dump();
+            return YES;
+        }
         int vk = e.keyCode < 128 ? vk_of[e.keyCode] : 0, ch = 0;
         if (e.type == NSEventTypeKeyDown && e.characters.length == 1) {
             unichar u = [e.characters characterAtIndex:0];
@@ -305,4 +314,6 @@ void window_pump(void) {
         }
         if (win && !win.isKeyWindow) set_cursor_hidden(0);
     }
+    void ddraw_flush_present(void);
+    ddraw_flush_present();                 // a frame another thread presented since the last pump
 }

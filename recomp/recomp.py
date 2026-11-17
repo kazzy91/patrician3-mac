@@ -150,6 +150,7 @@ class Recompiler:
         self.functions = functions or {}      # guest address -> limit (for direct-call targets)
         self.nfs = False                      # NFS speed.exe address patches: off for other games
         self.patched = set()                  # code bytes the program rewrites at run time (self-modifying code)
+        self.extra_labels = {}                # function -> addresses that must be labels (resumable functions)
         self.calls = False                    # True: translate calls/tail jumps (needs the callees' C too)
         self.seen = {}
         self.ft_exits = {}
@@ -344,7 +345,7 @@ class Recompiler:
         """Recursive descent from the entry. Without calls enabled, stays inside [addr, limit). With calls enabled,
         follows branches anywhere that isn't another function's start (Ghidra splits SEH funclets out of the middle of
         functions), and records where execution falls through into another function (self.ft_exits)."""
-        seen, work = {}, [addr]
+        seen, work = {}, [addr] + sorted(self.extra_labels.get(addr, ()))   # re-entry points are roots too
         while work:
             pc = work.pop()
             while pc not in seen:
@@ -446,6 +447,7 @@ class Recompiler:
                 targets.add(i.operands[0].imm)
         for tab in self.tables.values():
             targets.update(tab.values())
+        targets |= self.extra_labels.get(addr, set())     # re-entry points (C++ catch continuations)
         targets &= set(self.seen)
         body = []
         if insns[0].address != addr:
