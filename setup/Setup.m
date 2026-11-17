@@ -16,7 +16,8 @@ static const int STEPS = 6;
     NSWindow *window;
     NSTextField *pathField, *status;
     NSButton *chooseButton, *buildButton;
-    NSProgressIndicator *progress;
+    NSProgressIndicator *progress, *spinner;
+    NSFileHandle *output;
     NSTextView *logView;
     NSString *gamePath, *installedApp, *lastError;
     NSFileHandle *logFile;
@@ -56,6 +57,11 @@ static NSTextField *label(NSString *text, CGFloat size, BOOL bold) {
     progress.indeterminate = NO;
     progress.minValue = 0;
     progress.maxValue = STEPS;
+    progress.hidden = YES;                        // shown once a build starts
+    spinner = [NSProgressIndicator new];
+    spinner.style = NSProgressIndicatorStyleSpinning;
+    spinner.controlSize = NSControlSizeSmall;
+    spinner.displayedWhenStopped = NO;
     status = label(@"", 12, NO);
     status.preferredMaxLayoutWidth = 600;
 
@@ -66,18 +72,20 @@ static NSTextField *label(NSString *text, CGFloat size, BOOL bold) {
     logView.textColor = NSColor.secondaryLabelColor;
     scroll.borderType = NSBezelBorder;
 
-    for (NSView *x in @[title, intro, pathField, chooseButton, buildButton, progress, status, scroll]) {
+    for (NSView *x in @[title, intro, pathField, chooseButton, buildButton, progress, spinner, status, scroll]) {
         x.translatesAutoresizingMaskIntoConstraints = NO;
         [v addSubview:x];
     }
-    NSDictionary *d = NSDictionaryOfVariableBindings(title, intro, pathField, chooseButton, buildButton, progress, status, scroll);
+    NSDictionary *d = NSDictionaryOfVariableBindings(title, intro, pathField, chooseButton, buildButton, progress, spinner, status, scroll);
     for (NSString *f in @[@"H:|-20-[title]-20-|", @"H:|-20-[intro]-20-|", @"H:|-20-[pathField]-[chooseButton]-20-|",
-                          @"H:|-20-[progress]-20-|", @"H:|-20-[status]-[buildButton]-20-|", @"H:|-20-[scroll]-20-|",
+                          @"H:|-20-[progress]-20-|", @"H:|-20-[spinner]-6-[status]-[buildButton]-20-|", @"H:|-20-[scroll]-20-|",
                           @"V:|-18-[title]-10-[intro]-16-[chooseButton]-16-[progress]-10-[buildButton]-14-[scroll(>=160)]-20-|"])
         [v addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:f options:0 metrics:nil views:d]];
     [v addConstraint:[NSLayoutConstraint constraintWithItem:pathField attribute:NSLayoutAttributeCenterY relatedBy:NSLayoutRelationEqual
                                                      toItem:chooseButton attribute:NSLayoutAttributeCenterY multiplier:1 constant:0]];
     [v addConstraint:[NSLayoutConstraint constraintWithItem:status attribute:NSLayoutAttributeCenterY relatedBy:NSLayoutRelationEqual
+                                                     toItem:buildButton attribute:NSLayoutAttributeCenterY multiplier:1 constant:0]];
+    [v addConstraint:[NSLayoutConstraint constraintWithItem:spinner attribute:NSLayoutAttributeCenterY relatedBy:NSLayoutRelationEqual
                                                      toItem:buildButton attribute:NSLayoutAttributeCenterY multiplier:1 constant:0]];
     [pathField setContentCompressionResistancePriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationHorizontal];
     [status setContentCompressionResistancePriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationHorizontal];
@@ -192,7 +200,7 @@ static NSTextField *label(NSString *text, CGFloat size, BOOL bold) {
         NSScanner *s = [NSScanner scannerWithString:[line substringFromIndex:6]];
         int n = 0;
         [s scanInt:&n];
-        progress.doubleValue = n - 1;
+        progress.doubleValue = n - 0.5;           // a step under way shows as half done
         [self setStatus:[[line substringFromIndex:6 + s.scanLocation] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet] error:NO];
     } else if ([line hasPrefix:@"@done "]) {
         installedApp = [line substringFromIndex:6];
@@ -213,6 +221,9 @@ static NSTextField *label(NSString *text, CGFloat size, BOOL bold) {
     buildButton.enabled = chooseButton.enabled = NO;
     lastError = nil;
     progress.doubleValue = 0;
+    progress.hidden = NO;
+    [spinner startAnimation:nil];
+    [self setStatus:@"Starting…" error:NO];
     logView.string = @"";
     NSString *logs = [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Logs"];
     [NSFileManager.defaultManager createDirectoryAtPath:logs withIntermediateDirectories:YES attributes:nil error:nil];
@@ -247,26 +258,38 @@ static NSTextField *label(NSString *text, CGFloat size, BOOL bold) {
         return;
     }
     pending = [NSMutableData new];
-    NSFileHandle *out = [[NSFileHandle alloc] initWithFileDescriptor:fds[0] closeOnDealloc:YES];
-    out.readabilityHandler = ^(NSFileHandle *h) {
+    output = [[NSFileHandle alloc] initWithFileDescriptor:fds[0] closeOnDealloc:YES];
+    __weak Setup *weak = self;                       // Setup lives as long as the app; weak only to avoid a cycle
+    pid_t pid = child;
+    output.readabilityHandler = ^(NSFileHandle *h) {
         NSData *data = h.availableData;
         if (!data.length) {                           // end of output: the script has finished
             h.readabilityHandler = nil;
             int st = 0;
-            waitpid(self->child, &st, 0);
+            waitpid(pid, &st, 0);
             dispatch_async(dispatch_get_main_queue(), ^{
-                [self flushPending:YES];
-                self->child = 0;
-                [self finished:WIFEXITED(st) ? WEXITSTATUS(st) : -1];
+                Setup *me = weak;
+                [me flushPending:YES];
+                [me buildEnded:WIFEXITED(st) ? WEXITSTATUS(st) : -1];
             });
             return;
         }
         dispatch_async(dispatch_get_main_queue(), ^{
-            [self->logFile writeData:data];
-            [self->pending appendData:data];
-            [self flushPending:NO];
+            [weak received:data];
         });
     };
+}
+
+- (void)received:(NSData *)data {
+    [logFile writeData:data];
+    [pending appendData:data];
+    [self flushPending:NO];
+}
+
+- (void)buildEnded:(int)code {
+    child = 0;
+    output = nil;
+    [self finished:code];
 }
 
 - (void)flushPending:(BOOL)all {
@@ -290,6 +313,7 @@ static NSTextField *label(NSString *text, CGFloat size, BOOL bold) {
     logFile = nil;
     if (activity) [NSProcessInfo.processInfo endActivity:activity];
     activity = nil;
+    [spinner stopAnimation:nil];
     chooseButton.enabled = YES;
     buildButton.enabled = YES;
     if (code == 0 && installedApp) {
